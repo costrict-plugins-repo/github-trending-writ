@@ -1,0 +1,739 @@
+"""Phase 3: Ingestion and migration tests.
+
+Tests Markdown parsing, schema validation of parsed rules, and migration integration.
+Parser tests are pure unit tests (TEST-ISO-001). Migration tests require Neo4j.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from textwrap import dedent
+
+import pytest
+import pytest_asyncio
+
+from writ.config import get_neo4j_password, get_neo4j_uri, get_neo4j_user
+from writ.graph.db import Neo4jConnection
+from writ.graph.ingest import (
+    discover_rule_files,
+    parse_rules_from_file,
+    validate_parsed_rule,
+)
+
+NEO4J_URI = get_neo4j_uri()
+NEO4J_USER = get_neo4j_user()
+NEO4J_PASSWORD = get_neo4j_password()
+
+SAMPLE_RULE = dedent("""\
+    # Test Document
+
+    <!-- RULE START: ARCH-ORG-001 -->
+    ## Rule ARCH-ORG-001: Code Organization
+
+    **Domain**: Architecture
+    **Severity**: High
+    **Scope**: module
+
+    ### Trigger
+    When creating a class that contains logic from a different layer.
+
+    ### Statement
+    Each class must belong to exactly one architectural layer.
+
+    ### Violation (bad)
+    Controller contains SQL query.
+
+    ### Pass (good)
+    Controller delegates to service.
+
+    ### Enforcement
+    Per-slice findings table. See also ARCH-DI-001.
+
+    ### Rationale
+    Mixed layers create untestable classes.
+    <!-- RULE END: ARCH-ORG-001 -->
+""")
+
+SAMPLE_TWO_RULES = dedent("""\
+    # Multi-rule file
+
+    <!-- RULE START: DB-SQL-001 -->
+    ## Rule DB-SQL-001: Named Binds
+
+    **Domain**: Database
+    **Severity**: High
+    **Scope**: file
+
+    ### Trigger
+    When writing raw SQL with parameter placeholders.
+
+    ### Statement
+    Use named bind keys instead of positional placeholders.
+
+    ### Violation (bad)
+    Positional ? placeholders.
+
+    ### Pass (good)
+    Named :customerId binds.
+
+    ### Enforcement
+    Code review.
+
+    ### Rationale
+    Named binds are self-documenting.
+    <!-- RULE END: DB-SQL-001 -->
+
+    ---
+
+    <!-- RULE START: DB-SQL-002 -->
+    ## Rule DB-SQL-002: Minimal Fragmentation
+
+    **Domain**: Database
+    **Severity**: Medium
+    **Scope**: file
+
+    ### Trigger
+    When SQL is constructed via string concatenation.
+
+    ### Statement
+    Define SQL in a single heredoc or multi-line string.
+
+    ### Violation (bad)
+    Concatenated SQL fragments.
+
+    ### Pass (good)
+    Single heredoc SQL.
+
+    ### Enforcement
+    Code review.
+
+    ### Rationale
+    Fragmented SQL is harder to debug.
+    <!-- RULE END: DB-SQL-002 -->
+""")
+
+SAMPLE_MANDATORY_TRUE = dedent("""\
+    <!-- RULE START: ARCH-TEST-001 -->
+    ## Rule ARCH-TEST-001: Test Rule
+
+    **Domain**: Testing
+    **Severity**: High
+    **Scope**: file
+    **Mandatory**: true
+
+    ### Trigger
+    When testing.
+
+    ### Statement
+    Must test.
+
+    ### Violation (bad)
+    Bad code.
+
+    ### Pass (good)
+    Good code.
+
+    ### Enforcement
+    Code review.
+
+    ### Rationale
+    Because testing.
+    <!-- RULE END: ARCH-TEST-001 -->
+""")
+
+SAMPLE_ENF_MANDATORY_FALSE = dedent("""\
+    <!-- RULE START: ENF-TEST-001 -->
+    ## Rule ENF-TEST-001: Override Test
+
+    **Domain**: AI Enforcement
+    **Severity**: Critical
+    **Scope**: session
+    **Mandatory**: false
+
+    ### Trigger
+    When testing override.
+
+    ### Statement
+    Mandatory can be overridden.
+
+    ### Violation (bad)
+    No override.
+
+    ### Pass (good)
+    Override works.
+
+    ### Enforcement
+    Code review.
+
+    ### Rationale
+    Explicit overrides convention.
+    <!-- RULE END: ENF-TEST-001 -->
+""")
+
+SAMPLE_CUSTOM_SCOPE = dedent("""\
+    <!-- RULE START: ARCH-SCOPE-001 -->
+    ## Rule ARCH-SCOPE-001: Scope Test
+
+    **Domain**: Testing
+    **Severity**: High
+    **Scope**: policy
+
+    ### Trigger
+    When testing scope extensibility.
+
+    ### Statement
+    Custom scopes should validate.
+
+    ### Violation (bad)
+    Rejected scope.
+
+    ### Pass (good)
+    Accepted scope.
+
+    ### Enforcement
+    Code review.
+
+    ### Rationale
+    Extensible scope enum.
+    <!-- RULE END: ARCH-SCOPE-001 -->
+""")
+
+SAMPLE_ENF_RULE = dedent("""\
+    <!-- RULE START: ENF-GATE-001 -->
+    ## Rule ENF-GATE-001: Phase A Gate
+
+    **Domain**: AI Enforcement
+    **Severity**: Critical
+    **Scope**: session
+
+    ### Trigger
+    When AI completes Phase A.
+
+    ### Statement
+    Phase A must be approved before Phase B.
+
+    ### Violation (bad)
+    AI proceeds without approval.
+
+    ### Pass (good)
+    AI halts and waits.
+
+    ### Enforcement
+    Gate file check.
+
+    ### Rationale
+    Human review catches errors.
+    <!-- RULE END: ENF-GATE-001 -->
+""")
+
+NO_MARKERS = dedent("""\
+    # Core Principles
+
+    ## DRY
+    Before writing new code, search for similar implementations.
+
+    ## SOLID
+    SRP, OCP, LSP, ISP, DIP.
+""")
+
+
+@pytest.fixture()
+def tmp_rule_file(tmp_path: Path) -> Path:
+    f = tmp_path / "test_rule.md"
+    f.write_text(SAMPLE_RULE)
+    return f
+
+
+@pytest.fixture()
+def tmp_multi_file(tmp_path: Path) -> Path:
+    f = tmp_path / "multi_rules.md"
+    f.write_text(SAMPLE_TWO_RULES)
+    return f
+
+
+@pytest.fixture()
+def tmp_enf_file(tmp_path: Path) -> Path:
+    f = tmp_path / "enf_rule.md"
+    f.write_text(SAMPLE_ENF_RULE)
+    return f
+
+
+@pytest.fixture()
+def tmp_no_markers(tmp_path: Path) -> Path:
+    f = tmp_path / "no_markers.md"
+    f.write_text(NO_MARKERS)
+    return f
+
+
+@pytest.fixture()
+def tmp_mandatory_true(tmp_path: Path) -> Path:
+    f = tmp_path / "mandatory_true.md"
+    f.write_text(SAMPLE_MANDATORY_TRUE)
+    return f
+
+
+@pytest.fixture()
+def tmp_enf_mandatory_false(tmp_path: Path) -> Path:
+    f = tmp_path / "enf_mandatory_false.md"
+    f.write_text(SAMPLE_ENF_MANDATORY_FALSE)
+    return f
+
+
+@pytest.fixture()
+def tmp_custom_scope(tmp_path: Path) -> Path:
+    f = tmp_path / "custom_scope.md"
+    f.write_text(SAMPLE_CUSTOM_SCOPE)
+    return f
+
+
+@pytest_asyncio.fixture()
+async def db():
+    conn = Neo4jConnection(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+    await conn.clear_all()
+    yield conn
+    await conn.clear_all()
+    await conn.close()
+
+
+class TestMarkdownParser:
+    """Markdown rule block extraction."""
+
+    def test_parse_single_rule(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        assert len(rules) == 1
+        assert rules[0]["rule_id"] == "ARCH-ORG-001"
+
+    def test_parse_multiple_rules_from_one_file(self, tmp_multi_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_multi_file)
+        assert len(rules) == 2
+        ids = [r["rule_id"] for r in rules]
+        assert "DB-SQL-001" in ids
+        assert "DB-SQL-002" in ids
+
+    def test_skip_file_without_markers(self, tmp_no_markers: Path) -> None:
+        rules = parse_rules_from_file(tmp_no_markers)
+        assert len(rules) == 0
+
+    def test_metadata_extraction(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        rule = rules[0]
+        assert rule["domain"] == "Architecture"
+        assert rule["severity"] == "high"
+        assert rule["scope"] == "module"
+
+    def test_section_extraction(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        rule = rules[0]
+        assert "logic from a different layer" in rule["trigger"]
+        assert "one architectural layer" in rule["statement"]
+        assert "SQL query" in rule["violation"]
+        assert "delegates to service" in rule["pass_example"]
+        assert "Per-slice" in rule["enforcement"]
+        assert "untestable" in rule["rationale"]
+
+    def test_graph_only_defaults_applied(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        rule = rules[0]
+        assert rule["confidence"] == "production-validated"
+        assert rule["evidence"] == "doc:original-bible"
+        assert rule["staleness_window"] == 365
+        assert "last_validated" in rule
+
+    def test_enf_prefix_no_longer_implies_mandatory(self, tmp_enf_file: Path) -> None:
+        """Per writ-evolution.md Section 2.2 (applied 2026-05-09): ENF-
+        prefix no longer auto-defaults mandatory to True. The fixture
+        omits the explicit **Mandatory** field, so the parser must
+        return False (default), not True (old convention)."""
+        rules = parse_rules_from_file(tmp_enf_file)
+        assert rules[0]["mandatory"] is False
+
+    def test_non_enf_not_mandatory(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        assert rules[0]["mandatory"] is False
+
+    def test_cross_references_detected(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        refs = rules[0].get("_cross_references", [])
+        assert "ARCH-DI-001" in refs
+
+    def test_validated_rule_passes_schema(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        validated = validate_parsed_rule(rules[0])
+        assert validated.rule_id == "ARCH-ORG-001"
+
+
+class TestMandatoryParsing:
+    """Phase 1b: Mandatory field parsing from Markdown metadata."""
+
+    def test_explicit_mandatory_true(self, tmp_mandatory_true: Path) -> None:
+        rules = parse_rules_from_file(tmp_mandatory_true)
+        assert rules[0]["mandatory"] is True
+        assert not rules[0]["rule_id"].startswith("ENF-")
+
+    def test_explicit_mandatory_false_overrides_enf(self, tmp_enf_mandatory_false: Path) -> None:
+        rules = parse_rules_from_file(tmp_enf_mandatory_false)
+        assert rules[0]["mandatory"] is False
+        assert rules[0]["rule_id"].startswith("ENF-")
+
+    def test_absent_mandatory_enf_defaults_false(self, tmp_enf_file: Path) -> None:
+        """Per writ-evolution.md Section 2.2: defaults to False, not
+        True-on-ENF-prefix. Convention removed 2026-05-09."""
+        rules = parse_rules_from_file(tmp_enf_file)
+        assert rules[0]["mandatory"] is False
+
+    def test_absent_mandatory_non_enf_defaults_false(self, tmp_rule_file: Path) -> None:
+        rules = parse_rules_from_file(tmp_rule_file)
+        assert rules[0]["mandatory"] is False
+
+    def test_explicit_mandatory_validates(self, tmp_mandatory_true: Path) -> None:
+        rules = parse_rules_from_file(tmp_mandatory_true)
+        validated = validate_parsed_rule(rules[0])
+        assert validated.mandatory is True
+
+
+class TestScopeExtensibility:
+    """Phase 1c: Ingest passes arbitrary scope values through to schema validation."""
+
+    def test_custom_scope_parses(self, tmp_custom_scope: Path) -> None:
+        rules = parse_rules_from_file(tmp_custom_scope)
+        assert rules[0]["scope"] == "policy"
+
+    def test_custom_scope_validates(self, tmp_custom_scope: Path) -> None:
+        rules = parse_rules_from_file(tmp_custom_scope)
+        validated = validate_parsed_rule(rules[0])
+        assert validated.scope == "policy"
+
+
+class TestNeo4jConstraints:
+    """Phase 1a: Neo4j uniqueness constraint and indexes."""
+
+    @pytest.mark.asyncio
+    async def test_apply_constraints_idempotent(self, db: Neo4jConnection) -> None:
+        await db.apply_constraints()
+        await db.apply_constraints()
+
+    @pytest.mark.asyncio
+    async def test_merge_idempotent_with_constraints(self, db: Neo4jConnection) -> None:
+        await db.apply_constraints()
+        rule_data = {
+            "rule_id": "TEST-CONST-001",
+            "domain": "Testing",
+            "severity": "high",
+            "scope": "file",
+            "trigger": "test",
+            "statement": "test",
+            "violation": "test",
+            "pass_example": "test",
+            "enforcement": "test",
+            "rationale": "test",
+            "mandatory": False,
+            "confidence": "production-validated",
+            "evidence": "doc:original-bible",
+            "staleness_window": 365,
+            "last_validated": "2026-03-28",
+        }
+        await db.create_rule(rule_data)
+        await db.create_rule(rule_data)
+        count = await db.count_rules()
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_constraints_exist(self, db: Neo4jConnection) -> None:
+        await db.apply_constraints()
+        constraints = await db.list_constraints()
+        # M.2: identity is the composite (rule_id, project), not single rule_id.
+        rule_uniq = [
+            c for c in constraints
+            if (c.get("labelsOrTypes") or []) == ["Rule"]
+            and set(c.get("properties") or []) == {"rule_id", "project"}
+        ]
+        assert rule_uniq, f"missing composite (rule_id, project) constraint; have {[c['name'] for c in constraints]}"
+
+    @pytest.mark.asyncio
+    async def test_indexes_exist(self, db: Neo4jConnection) -> None:
+        await db.apply_constraints()
+        indexes = await db.list_indexes()
+        names = [i["name"] for i in indexes]
+        assert "rule_domain" in names
+        assert "rule_mandatory" in names
+
+
+class TestMigrationIntegration:
+    """Full migration against live Neo4j.
+
+    bible/ is no longer committed to the repo (writ-corpus.cypher is the
+    shipped source; see writ/graph/dump.py). These tests exercise the
+    markdown import/export path itself, which stays fully supported for
+    hand-editing -- materialize bible/ from the dump here so that coverage
+    doesn't just silently skip in a fresh checkout with no bible/ on disk.
+    """
+
+    @pytest_asyncio.fixture(scope="class", autouse=True)
+    async def materialize_bible_if_missing(self):
+        from writ.export import export_rules_to_markdown
+        from writ.graph.dump import import_cypher_dump
+
+        bible_dir = Path("bible/")
+        dump_file = Path("writ-corpus.cypher")
+        created = False
+        if not bible_dir.exists() and dump_file.exists():
+            conn = Neo4jConnection(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+            await import_cypher_dump(conn, dump_file.read_text())
+            await export_rules_to_markdown(conn, bible_dir)
+            await conn.clear_all()
+            await conn.close()
+            created = True
+
+        yield
+
+        if created:
+            import shutil
+
+            shutil.rmtree(bible_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_migrate_real_bible(self, db: Neo4jConnection) -> None:
+        bible_dir = Path("bible/")
+        if not bible_dir.exists():
+            pytest.skip("bible/ directory not found")
+
+        files = discover_rule_files(bible_dir)
+        # `create_rule` is MERGE-on-rule_id, so the post-migration DB count
+        # is the count of UNIQUE rule_ids across all files. bible/ contains
+        # duplicate rule_ids between bible/methodology/<topic>/rules.md and
+        # bible/<topic>/rules.md (e.g. ENF-COMMS-001 appears in both
+        # bible/communication/rules.md and bible/methodology/communication/
+        # rules.md). Counting raw create_rule calls would over-count; counting
+        # unique IDs is the right post-MERGE expectation.
+        unique_ids: set[str] = set()
+        for f in files:
+            parsed = parse_rules_from_file(f)
+            for rule_data in parsed:
+                validated = validate_parsed_rule(rule_data)
+                clean = {k: v for k, v in rule_data.items() if not k.startswith("_")}
+                await db.create_rule(clean)
+                unique_ids.add(rule_data["rule_id"])
+
+        count = await db.count_rules()
+        assert count == len(unique_ids), (
+            f"Expected {len(unique_ids)} unique rule_ids in DB, got {count}"
+        )
+        assert count > 0
+        print(f"\nMigrated {count} rules from {len(files)} files")
+
+    @pytest.mark.asyncio
+    async def test_idempotent(self, db: Neo4jConnection) -> None:
+        bible_dir = Path("bible/")
+        if not bible_dir.exists():
+            pytest.skip("bible/ directory not found")
+
+        files = discover_rule_files(bible_dir)
+        for _ in range(2):
+            for f in files:
+                for rule_data in parse_rules_from_file(f):
+                    clean = {k: v for k, v in rule_data.items() if not k.startswith("_")}
+                    await db.create_rule(clean)
+
+        # Idempotency contract: re-ingesting must not duplicate. The DB count
+        # after two passes equals the count of UNIQUE rule_ids -- not the raw
+        # parsed-record count, which over-counts duplicate IDs that legitimately
+        # appear in both bible/<topic>/rules.md and bible/methodology/<topic>/
+        # rules.md (MERGE collapses them to one node).
+        unique_ids: set[str] = set()
+        for f in files:
+            for rule_data in parse_rules_from_file(f):
+                unique_ids.add(rule_data["rule_id"])
+
+        count = await db.count_rules()
+        assert count == len(unique_ids), (
+            f"Expected {len(unique_ids)} unique rule_ids in DB after "
+            f"idempotent re-ingest, got {count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skeleton_edges_created(self, db: Neo4jConnection) -> None:
+        bible_dir = Path("bible/")
+        if not bible_dir.exists():
+            pytest.skip("bible/ directory not found")
+
+        files = discover_rule_files(bible_dir)
+        all_rules: list[dict] = []
+        for f in files:
+            all_rules.extend(parse_rules_from_file(f))
+
+        rule_ids = {r["rule_id"] for r in all_rules}
+
+        for rule_data in all_rules:
+            clean = {k: v for k, v in rule_data.items() if not k.startswith("_")}
+            await db.create_rule(clean)
+
+        edge_count = 0
+        for rule_data in all_rules:
+            for ref_id in rule_data.get("_cross_references", []):
+                if ref_id in rule_ids:
+                    await db.create_edge("RELATED_TO", rule_data["rule_id"], ref_id)
+                    edge_count += 1
+
+        assert edge_count > 0
+        print(f"\nCreated {edge_count} RELATED_TO edges")
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: Category parsing and BELONGS_TO edge extraction (TDD RED skeletons)
+# ---------------------------------------------------------------------------
+
+# Sample RULE START block with a Category field.
+SAMPLE_RULE_WITH_CATEGORY = dedent("""\
+    <!-- RULE START: ARCH-ORG-002 -->
+    ## Rule ARCH-ORG-002: Layer Separation
+
+    **Domain**: Architecture
+    **Severity**: High
+    **Scope**: module
+    **Category**: CODING-RULES/security
+
+    ### Trigger
+    When mixing concerns across architectural layers.
+
+    ### Statement
+    Keep layers separate.
+
+    ### Violation (bad)
+    Mixed layers.
+
+    ### Pass (good)
+    Clean layers.
+
+    ### Enforcement
+    Code review.
+
+    ### Rationale
+    Separation of concerns.
+    <!-- RULE END: ARCH-ORG-002 -->
+""")
+
+# Sample NODE START block with a Category field.
+SAMPLE_NODE_WITH_CATEGORY = dedent("""\
+    <!-- NODE START type=Skill id=SKL-PROC-TDD-001 -->
+    **Category**: PROCESS/tdd
+
+    Skill body text here.
+    <!-- NODE END: SKL-PROC-TDD-001 -->
+""")
+
+
+@pytest.fixture()
+def tmp_rule_with_category(tmp_path: Path) -> Path:
+    f = tmp_path / "rule_with_category.md"
+    f.write_text(SAMPLE_RULE_WITH_CATEGORY)
+    return f
+
+
+@pytest.fixture()
+def tmp_node_with_category(tmp_path: Path) -> Path:
+    f = tmp_path / "node_with_category.md"
+    f.write_text(SAMPLE_NODE_WITH_CATEGORY)
+    return f
+
+
+class TestCategoryParsing:
+    """Phase 0: parse_rules_from_file and parse_nodes_from_file surface the
+    'category' field when a **Category** metadata line is present in a block.
+
+    RED until ingest.py extracts the 'category' key from RULE START /
+    NODE START metadata lines.
+    """
+
+    def test_rule_start_block_parses_category_field(
+        self, tmp_rule_with_category: Path
+    ) -> None:
+        """A RULE START block with **Category**: CODING-RULES/security must
+        set result['category'] == 'CODING-RULES/security'."""
+        rules = parse_rules_from_file(tmp_rule_with_category)
+        assert len(rules) == 1
+        assert rules[0].get("category") == "CODING-RULES/security"
+
+    def test_node_start_block_parses_category_field(
+        self, tmp_node_with_category: Path
+    ) -> None:
+        """A NODE START block with **Category**: PROCESS/tdd must set
+        result['category'] == 'PROCESS/tdd'."""
+        from writ.graph.ingest import parse_nodes_from_file
+
+        nodes = parse_nodes_from_file(tmp_node_with_category)
+        assert len(nodes) == 1
+        assert nodes[0].get("category") == "PROCESS/tdd"
+
+
+class TestExtractBelongsToEdges:
+    """Phase 0: extract_belongs_to_edges derives BELONGS_TO edge dicts from
+    a list of parsed node dicts that carry a 'category' key.
+
+    RED until writ.graph.ingest.extract_belongs_to_edges is implemented.
+    """
+
+    def test_emits_edge_for_node_with_category(self) -> None:
+        """A single Rule node dict with category='CODING-RULES/architecture'
+        produces exactly one BELONGS_TO edge record."""
+        from writ.graph.ingest import extract_belongs_to_edges
+
+        nodes = [
+            {
+                "node_type": "Rule",
+                "rule_id": "ARCH-ORG-001",
+                "category": "CODING-RULES/architecture",
+            }
+        ]
+        edges = extract_belongs_to_edges(nodes)
+        assert edges == [
+            {
+                "source": "ARCH-ORG-001",
+                "target": "CODING-RULES/architecture",
+                "type": "BELONGS_TO",
+            }
+        ]
+
+    def test_skips_node_without_category(self) -> None:
+        """A node dict with no 'category' key must produce an empty edge list."""
+        from writ.graph.ingest import extract_belongs_to_edges
+
+        nodes = [
+            {
+                "node_type": "Rule",
+                "rule_id": "ARCH-ORG-001",
+            }
+        ]
+        edges = extract_belongs_to_edges(nodes)
+        assert edges == []
+
+    def test_multiple_nodes_emit_multiple_edges(self) -> None:
+        """Three nodes, two with categories and one without, produce exactly
+        two BELONGS_TO edge records in input order."""
+        from writ.graph.ingest import extract_belongs_to_edges
+
+        nodes = [
+            {
+                "node_type": "Rule",
+                "rule_id": "ARCH-ORG-001",
+                "category": "CODING-RULES/architecture",
+            },
+            {
+                "node_type": "Skill",
+                "skill_id": "SKL-PROC-001",
+                # no category
+            },
+            {
+                "node_type": "Rule",
+                "rule_id": "ARCH-ORG-002",
+                "category": "CODING-RULES/security",
+            },
+        ]
+        edges = extract_belongs_to_edges(nodes)
+        assert len(edges) == 2
+        sources = [e["source"] for e in edges]
+        assert "ARCH-ORG-001" in sources
+        assert "ARCH-ORG-002" in sources
+        for edge in edges:
+            assert edge["type"] == "BELONGS_TO"
+            assert "target" in edge
+            assert "source" in edge

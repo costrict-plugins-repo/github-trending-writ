@@ -1,0 +1,2145 @@
+"""tests/test_gate_token_binding.py
+
+Cycle 1 (plan.md finding 4): the gate token records what it authorizes -- the gate and
+the plan fingerprint -- instead of being a bare secret any pending gate will accept. A
+token minted for one purpose could otherwise be replayed against whatever gate happened
+to be pending when it was consumed (a plan approval spending itself on a decision-memory
+candidate promotion, or a stale token from a re-armed session advancing the wrong gate).
+
+Design decisions this file's tests commit to (none of these are stated verbatim in
+plan.md by name; they are the narrowest reading of its Analysis section, corrected once
+after review -- see below):
+
+  * `mint_gate_token(session_id, *, gate, plan_hash, token=None)` writes the three-line
+    file and returns the token (a fresh one unless `token=` overrides it -- the override
+    exists so a test can drive the SAME token through two independent writers and compare
+    bytes, per capability 6).
+  * The bare rename-mutex (today's whole `claim_gate_token` body: rename, read, remove,
+    compare the WHOLE file content against `supplied_token`) is kept as its own internal
+    primitive, `_claim_token_mutex(session_id, supplied_token)`, UNCHANGED in behavior.
+    tests/test_advance_phase_token_claim.py's four pre-existing tests point at that name
+    now, with their original two-positional-argument call, and are not part of this
+    cycle's red set.
+  * The public `claim_gate_token(session_id, supplied_token, *, gate, plan_hash)` has
+    `gate` and `plan_hash` keyword-only and REQUIRED -- no default. An earlier version of
+    this file gave them `=None` defaults meaning "do not enforce this half of the
+    binding," which review correctly rejected: a fail-open default on the function that
+    decides whether a human approved an action means a caller that forgets the argument
+    gets an unguarded claim and no error, silently reopening the hole this cycle exists
+    to close. Making them required turns "forgot to pass the binding" into a TypeError
+    at the call site instead of a silent bypass -- pinned below by
+    TestClaimRequiresBindingArguments. The now-required arguments are never satisfied
+    with a sentinel like `""` standing in for "don't check": a caller that genuinely has
+    no gate pending passes the literal empty string `gate=""` (what mint_gate_token wrote
+    for that state), which IS enforced -- it just happens to enforce "must be exactly
+    empty."
+  * The bash side of the byte-parity contract (capability 6) is a shared function,
+    `write_gate_token_file <path> <token> <gate> <plan_hash>`, added to bin/lib/common.sh
+    -- the same file that already owns `log_friction_event` and `writ_http_post`, the
+    other primitives auto-approve-gate.sh shares with the rest of the hook surface.
+
+RED today: mint_gate_token, `_claim_token_mutex`, the gate=/plan_hash= REQUIRED keyword
+parameters on `claim_gate_token`, write_gate_token_file, and the next_gate/plan_hash keys
+on cmd_current_phase's JSON all do not exist yet. Each class below names the specific
+symbol whose absence makes it fail.
+
+Per ENF-SYS-005, TestConcurrentClaimsRealProcesses drives the claim primitive from real
+OS child processes against a real file in a real temp directory -- nothing here is
+proven with a mock, and the claim above about "exactly one wins" would not be provable
+any other way (a mocked os.rename tells you what you told it to return).
+
+Cleanup discipline: gate_token_path() hardcodes /tmp deliberately (its own docstring:
+the bash writer and the python reader must never be able to disagree on where the file
+lives), so unlike the session cache there is no WRIT_CACHE_DIR a test can redirect this
+into tmp_path. Every test that mints wraps the risky section in `_mint_cleanup(sid)`,
+which removes the file in a `finally` even when the test body raises -- that is the
+PRIMARY mechanism. The autouse `_no_leaked_gate_tokens` fixture below is the safety net:
+it snapshots /tmp/writ-gate-token-* before and after every test in this module and hands
+the difference to `tests/_gate_token_leak.py::confined_leak_sweep`, which removes -- and
+fails the test on -- every file whose session id could NOT belong to a live session, and
+LEAVES on disk any file whose id is drawn only from `[0-9a-f-]`, because that is the
+alphabet a real Claude Code session's own id is built from and this suite cannot prove it
+wrote such a file rather than a human in another window. A left file is reported as a
+`ForeignGateTokenWarning` instead of deleted, and the module-scoped guard in
+tests/_gate_token_leak.py reports it again and fails the module at its boundary, so only
+the DELETION narrowed here: nothing stopped being detected. A test that forgot its own
+cleanup is still caught here rather than leaking a file into the real /tmp for the life of
+the machine (where a collision with a real session id would forge an approval).
+
+Per TEST-TDD-001 / SKL-PROC-WRIT-FAILURE-001: skeletons approved before implementation.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import multiprocessing
+import os
+import subprocess
+import uuid
+from pathlib import Path
+
+import pytest
+
+SKILL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+COMMON_SH = os.path.join(SKILL_ROOT, "bin", "lib", "common.sh")
+
+# A plan.md shape already proven to pass approval_workflow._validate_phase_a (the same
+# text tests/test_pol6f_approval_workflow_extraction.py uses), parameterized on the one
+# capability checkbox so callers can flip [ ] <-> [x] without touching anything else --
+# that one edit is exactly what locators.plan_md_hash's checkbox normalization exists
+# to make a non-event (capability 9).
+_PLAN_TEMPLATE = (
+    "# Plan\n## Files\n- a.py\n## Analysis\nwhy\n## Rules Applied\nNo matching rules.\n"
+    "## Capabilities\n- {box} does the thing\n"
+)
+
+
+def _sid(label: str) -> str:
+    return f"gtb-{label}-{uuid.uuid4().hex[:8]}"
+
+
+def _write_plan(tmp_path, ticked: bool = False) -> Path:
+    plan = tmp_path / "plan.md"
+    plan.write_text(_PLAN_TEMPLATE.format(box="[x]" if ticked else "[ ]"))
+    return plan
+
+
+def _call_json(fn, *args) -> dict:
+    """Capture one function's stdout JSON, per tests/test_escalation_reset_on_advance.py."""
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(*args)
+    return json.loads(buf.getvalue().strip())
+
+
+def _call_advance_json(monkeypatch, fn, *args) -> dict:
+    """_call_json's counterpart for cmd_advance_phase specifically: that function
+    unconditionally does a bare `sys.stdin.read()` (it tolerates a piped prompt), which
+    pytest's default output capture replaces with an object that raises OSError on
+    read() -- see tests/test_pol6f_approval_workflow_extraction.py's `_advance` helper,
+    which stubs stdin for the same reason. Without this, a test whose token happens to
+    pass the line-1 match reaches that read() and fails on a capture-plumbing OSError
+    instead of the real assertion below it.
+    """
+    import io as _io
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO(""))
+    return _call_json(fn, *args)
+
+
+@contextlib.contextmanager
+def _mint_cleanup(sid: str):
+    """Guarantees /tmp/writ-gate-token-<sid> is removed after the block, even when the
+    block raises. This is the PRIMARY cleanup mechanism every test that mints uses; the
+    autouse _no_leaked_gate_tokens fixture below is the safety net that turns a
+    forgotten instance of this into a loud test failure instead of a silent /tmp leak.
+    """
+    from writ.session.gate_token import gate_token_path
+
+    try:
+        yield
+    finally:
+        try:
+            os.remove(gate_token_path(sid))
+        except OSError:
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_gate_tokens():
+    """Safety net, not the primary mechanism (see `_mint_cleanup`): every gate-token
+    test in this module is covered by this fixture even if it forgets its own cleanup.
+    A leaked file in the real /tmp is not a cosmetic issue: a later collision with a
+    real Claude Code session id would let that stray file be read as an approval it
+    never received.
+
+    THE DELETION IS CONFINED, and the decision lives in exactly one place. Everything
+    that appeared during the test goes to `confined_leak_sweep`, which removes only the
+    files whose session id could NOT belong to a live session; those come back as
+    `removed` and still fail this test by name. A file whose id is drawn only from
+    `[0-9a-f-]` comes back as `left_alone` instead, untouched, because the suite cannot
+    tell it from an approval a human typed in another window while the run was going.
+    `left_alone` is named here, not hidden inside the sweep, so the skip is visible at
+    this call site; `warn_about_left_alone` reports each such path, and the
+    module-scoped guard in tests/_gate_token_leak.py reports it again and fails the
+    module at its boundary.
+    """
+    from tests._gate_token_leak import (
+        confined_leak_sweep,
+        live_snapshot,
+        warn_about_left_alone,
+    )
+
+    before = live_snapshot()
+    yield
+    removed, left_alone = confined_leak_sweep(before)
+    warn_about_left_alone(left_alone)
+    assert not removed, f"test leaked gate token file(s) (now removed): {sorted(removed)}"
+
+
+# ---------------------------------------------------------------------------
+# Capability 6: token file format + bash/python writer byte parity
+# ---------------------------------------------------------------------------
+
+
+class TestTokenFileFormat:
+    """Line 1 token, line 2 bound gate, line 3 plan fingerprint."""
+
+    def test_mint_gate_token_writes_three_lines(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("format")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            with open(gate_token_path(sid)) as f:
+                lines = f.read().split("\n")
+            assert lines[0] == token
+            assert lines[1] == "phase-a"
+            assert lines[2] == "abc123def456"
+
+    def test_mint_gate_token_with_no_gate_pending_writes_an_empty_second_line(self):
+        """The state a promote-candidate-only approval mints: no phase gate pending."""
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("nogate")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="")
+            with open(gate_token_path(sid)) as f:
+                lines = f.read().split("\n")
+            assert lines[1] == ""
+            assert lines[2] == ""
+
+    def test_mint_gate_token_returns_the_token_it_wrote(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("returns")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="test-skeletons", plan_hash="deadbeef0000")
+            with open(gate_token_path(sid)) as f:
+                on_disk_first_line = f.read().split("\n")[0]
+            assert token == on_disk_first_line
+            assert token, "mint_gate_token must not return an empty token"
+
+    def test_bash_writer_and_mint_gate_token_are_byte_identical(self, tmp_path, monkeypatch):
+        """write_gate_token_file (bin/lib/common.sh) is the bash side of the same
+        contract. Both writers are driven with the SAME explicit token
+        (mint_gate_token's `token=` override exists precisely so this comparison is not
+        reconciling two independent random generators) and redirected to plain tmp_path
+        files via a monkeypatched gate_token_path, so this never touches the real /tmp
+        for a real session id and needs no _mint_cleanup.
+        """
+        import writ.session.gate_token as gt
+
+        sid = _sid("parity")
+        fixed_token = uuid.uuid4().hex
+        py_path = tmp_path / "py-token"
+        bash_path = tmp_path / "bash-token"
+
+        monkeypatch.setattr(gt, "gate_token_path", lambda session_id: str(py_path))
+        gt.mint_gate_token(sid, gate="phase-a", plan_hash="0123456789ab", token=fixed_token)
+
+        script = (
+            f'set -euo pipefail\nsource "{COMMON_SH}"\n'
+            f'write_gate_token_file "{bash_path}" "{fixed_token}" "phase-a" "0123456789ab"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        assert r.returncode == 0, f"write_gate_token_file failed: {r.stderr}"
+
+        py_bytes = py_path.read_bytes()
+        bash_bytes = bash_path.read_bytes()
+        assert py_bytes == bash_bytes, f"python bytes: {py_bytes!r}\nbash bytes: {bash_bytes!r}"
+
+
+# ---------------------------------------------------------------------------
+# Approval-integrity cycle: line 5, the rule a promotion approval authorizes.
+#
+# NOT part of cycle 1's numbered capabilities (this file's original docstring); these
+# classes pin the approval-integrity plan's own capability list instead:
+#   - "mint_gate_token writes five lines and the bash writer produces byte-identical
+#     bytes for the same inputs."
+#   - "A four-line token still authorizes a phase advance, and is refused for a rule
+#     promotion."
+#   - "cmd_current_phase reports rule_id, and a responder that omits the field
+#     yields an empty line 5 (no effect on a phase advance, promotion refused)."
+#
+# RED today: mint_gate_token has no rule_id parameter, claim_gate_token/
+# _binding_refusal/gate_binding_refusal cannot be given one, BINDING_RULE_MISMATCH
+# and read_gate_rule() do not exist, write_gate_token_file (bin/lib/common.sh) still
+# writes only four lines, and cmd_current_phase's JSON has no "rule_id" key.
+# ---------------------------------------------------------------------------
+
+
+class TestTokenFileFormatRuleLine:
+    """Line 5: the rule id a promotion approval authorizes, empty for every other
+    approval. Mirrors TestTokenFileFormat's candidate-line tests one level down."""
+
+    def test_mint_gate_token_writes_five_lines_with_rule_id_on_line_five(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("ruleline")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-TEST-001")
+            with open(gate_token_path(sid)) as f:
+                lines = f.read().split("\n")
+            assert len(lines) >= 5, f"expected at least 5 lines, got {lines!r}"
+            assert lines[4] == "ENF-TEST-001"
+
+    def test_mint_gate_token_without_rule_id_writes_an_empty_fifth_line(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("ruleline-empty")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            with open(gate_token_path(sid)) as f:
+                lines = f.read().split("\n")
+            assert lines[4] == ""
+
+    def test_bash_writer_and_mint_gate_token_are_byte_identical_with_a_rule_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The byte-parity contract, extended one line: write_gate_token_file gains
+        a sixth positional argument (rule_id) alongside its existing candidate_id
+        fifth, mirroring TestTokenFileFormat.test_bash_writer_and_mint_gate_token_
+        are_byte_identical exactly."""
+        import writ.session.gate_token as gt
+
+        sid = _sid("parity-rule")
+        fixed_token = uuid.uuid4().hex
+        py_path = tmp_path / "py-token"
+        bash_path = tmp_path / "bash-token"
+
+        monkeypatch.setattr(gt, "gate_token_path", lambda session_id: str(py_path))
+        gt.mint_gate_token(
+            sid, gate="", plan_hash="", rule_id="ENF-TEST-002", token=fixed_token,
+        )
+
+        script = (
+            f'set -euo pipefail\nsource "{COMMON_SH}"\n'
+            f'write_gate_token_file "{bash_path}" "{fixed_token}" "" "" "" "ENF-TEST-002"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        assert r.returncode == 0, f"write_gate_token_file failed: {r.stderr}"
+
+        py_bytes = py_path.read_bytes()
+        bash_bytes = bash_path.read_bytes()
+        assert py_bytes == bash_bytes, f"python bytes: {py_bytes!r}\nbash bytes: {bash_bytes!r}"
+
+
+class TestClaimRefusesRuleMismatch:
+    """The new refusal class, BINDING_RULE_MISMATCH, mirroring
+    TestPromoteCandidateBinding's candidate-mismatch reasoning one level down: an
+    approval surfaced for rule A must never be spendable on rule B."""
+
+    def test_claim_with_a_different_rule_id_is_refused(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("rulemismatch")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-RULE-A")
+            claimed = claim_gate_token(sid, token, gate="", plan_hash="", rule_id="ENF-RULE-B")
+            assert claimed is False
+
+    def test_claim_with_the_matching_rule_id_succeeds(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("rulematch")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-RULE-A")
+            claimed = claim_gate_token(sid, token, gate="", plan_hash="", rule_id="ENF-RULE-A")
+            assert claimed is True
+
+    def test_gate_binding_refusal_names_the_rule_mismatch_class_non_destructively(self):
+        from writ.session.gate_token import (
+            BINDING_RULE_MISMATCH,
+            gate_binding_refusal,
+            gate_token_path,
+            mint_gate_token,
+        )
+
+        sid = _sid("rulemismatchclass")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-RULE-A")
+            refusal = gate_binding_refusal(sid, gate="", plan_hash="", rule_id="ENF-RULE-B")
+            assert refusal == BINDING_RULE_MISMATCH
+            assert os.path.exists(gate_token_path(sid)), (
+                "a non-destructive pre-check must not consume the token"
+            )
+
+    def test_read_gate_rule_returns_the_bound_rule_id(self):
+        from writ.session.gate_token import mint_gate_token, read_gate_rule
+
+        sid = _sid("readrule")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-RULE-C")
+            assert read_gate_rule(sid) == "ENF-RULE-C"
+
+    def test_read_gate_rule_is_empty_when_no_rule_is_bound(self):
+        from writ.session.gate_token import mint_gate_token, read_gate_rule
+
+        sid = _sid("readrule-empty")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            assert read_gate_rule(sid) == ""
+
+
+class TestFourLineTokenBackwardCompatibleWithRuleBinding:
+    """A token minted before line 5 existed (candidate binding present, rule binding
+    absent) must keep advancing phases exactly as before, and must be refused for a
+    rule promotion, the SAME backward-compatible and fail-safe direction
+    _binding_refusal's own docstring already documents for the candidate line."""
+
+    def test_a_four_line_token_still_authorizes_a_phase_advance(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("fourline-advance")
+        with _mint_cleanup(sid):
+            # No rule_id kwarg at all: exactly what every caller wrote before this
+            # cycle. _line() reads a short file's line 5 as "" (module docstring,
+            # "BOUNDS-SAFE ON PURPOSE"), which is exactly what a phase advance's
+            # default rule_id="" compares against.
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash="abc123def456")
+            assert claimed is True
+
+    def test_a_four_line_token_is_refused_for_a_rule_promotion(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("fourline-promote")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="", plan_hash="")
+            claimed = claim_gate_token(sid, token, gate="", plan_hash="", rule_id="ENF-RULE-A")
+            assert claimed is False
+
+
+class TestCmdCurrentPhaseReportsRuleBinding:
+    """Extends TestCmdCurrentPhaseReportsBinding one field: cmd_current_phase must
+    report the rule a review surfaced, the way it already reports the candidate a
+    promotion-review surfaced."""
+
+    def test_reports_the_pending_review_rule_id(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_current_phase
+        from writ.session.cache import _read_cache, _write_cache
+
+        sid = _sid("rulebinding")
+        cache = _read_cache(sid)
+        cache.update({
+            "mode": "work", "current_phase": "implementation", "gates_approved": [],
+            "project_root": str(tmp_path), "pending_review_rule_id": "ENF-TEST-777",
+        })
+        _write_cache(sid, cache)
+
+        result = _call_json(cmd_current_phase, sid)
+        assert result["rule_id"] == "ENF-TEST-777"
+
+    def test_rule_id_is_empty_string_when_no_rule_is_pending(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_current_phase
+        from writ.session.cache import _read_cache, _write_cache
+
+        sid = _sid("norulebinding")
+        cache = _read_cache(sid)
+        cache.update({
+            "mode": "work", "current_phase": "implementation", "gates_approved": [],
+            "project_root": str(tmp_path),  # no pending_review_rule_id key at all
+        })
+        _write_cache(sid, cache)
+
+        result = _call_json(cmd_current_phase, sid)
+        assert result["rule_id"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Capability 7: read_gate_token stays line-1-only
+# ---------------------------------------------------------------------------
+
+
+class TestReadGateTokenLineOneOnly:
+    def test_read_gate_token_returns_exactly_the_minted_token(self):
+        from writ.session.gate_token import mint_gate_token, read_gate_token
+
+        sid = _sid("readline1")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            assert read_gate_token(sid) == token
+
+    def test_read_gate_token_on_a_bound_file_leaks_no_binding_text(self):
+        """Regression guard for the presence checks at gate.py:67/310 and the CLI's
+        expected_token read: they compare read_gate_token()'s return against a caller-
+        supplied token, so any binding text leaking onto line 1 breaks every match."""
+        from writ.session.gate_token import mint_gate_token, read_gate_token
+
+        sid = _sid("noleak")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="test-skeletons", plan_hash="0123456789ab")
+            result = read_gate_token(sid)
+            assert "\n" not in result
+            assert "test-skeletons" not in result
+            assert "0123456789ab" not in result
+
+
+# ---------------------------------------------------------------------------
+# claim_gate_token's binding arguments are required, not fail-open defaults
+# ---------------------------------------------------------------------------
+
+
+class TestClaimRequiresBindingArguments:
+    """gate and plan_hash are keyword-only and REQUIRED on the public claim_gate_token
+    -- no default. Omitting either must raise TypeError at the call site rather than
+    silently skipping enforcement: a None (or any other sentinel) default would be a
+    fail-open bypass on the function that decides whether a human approved an action,
+    just a greppable one.
+
+    test_omitting_both_raises_type_error is the one case actually red against today's
+    code: calling with exactly two positional arguments matches TODAY's (pre-cycle)
+    claim_gate_token(session_id, supplied_token) signature exactly, so today it runs
+    normally (returns False, no exception) and this test fails because pytest.raises
+    caught nothing.
+
+    test_omitting_gate_raises_type_error and test_omitting_plan_hash_raises_type_error
+    are NOT red today for the reason this class exists to prove: today's function
+    accepts no keyword arguments at all, so passing plan_hash= or gate= already raises
+    TypeError('unexpected keyword argument'), coincidentally satisfying
+    pytest.raises(TypeError) for the wrong reason. They will keep passing once
+    claim_gate_token gains the required keyword-only parameters, at which point the
+    SAME assertion is true for the intended reason ('missing 1 required keyword-only
+    argument'). Disclosed rather than hidden: an assertion that already passes today
+    is not evidence the property holds post-implementation, but pytest.raises(TypeError)
+    cannot distinguish the two TypeErrors without pinning CPython's exact message text,
+    which would make this test brittle for no real gain -- the case that matters
+    (omitting BOTH, the shape a careless caller most plausibly writes) is genuinely red.
+    """
+
+    def test_omitting_gate_raises_type_error(self):
+        from writ.session.gate_token import claim_gate_token
+
+        with pytest.raises(TypeError):
+            claim_gate_token("gtb-typeerror-nogate", "any-token", plan_hash="abc123def456")
+
+    def test_omitting_plan_hash_raises_type_error(self):
+        from writ.session.gate_token import claim_gate_token
+
+        with pytest.raises(TypeError):
+            claim_gate_token("gtb-typeerror-noplanhash", "any-token", gate="phase-a")
+
+    def test_omitting_both_raises_type_error(self):
+        from writ.session.gate_token import claim_gate_token
+
+        with pytest.raises(TypeError):
+            claim_gate_token("gtb-typeerror-neither", "any-token")
+
+
+# ---------------------------------------------------------------------------
+# Capability 8: gate-mismatch refusal
+# ---------------------------------------------------------------------------
+
+
+class TestClaimRefusesGateMismatch:
+    def test_claim_with_a_different_requested_gate_is_refused(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("gatemismatch")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            claimed = claim_gate_token(sid, token, gate="test-skeletons", plan_hash="abc123def456")
+            assert claimed is False
+
+    def test_claim_with_the_matching_gate_succeeds(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("gatematch")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash="abc123def456")
+            assert claimed is True
+
+    def test_a_token_minted_with_no_gate_pending_refuses_a_phase_advance_claim(self):
+        """The promote-candidate-shaped token (gate="") must not double as a
+        phase-advance token -- the one deliberate narrowing the plan calls out. Note
+        plan_hash="" here, matching the mint exactly: the CORRECT way to express "this
+        half is not being exercised" is to pass the real bound value, never a skip
+        sentinel (see this file's module docstring)."""
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("nogateclaim")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="", plan_hash="")
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash="")
+            assert claimed is False
+
+    def test_the_cli_advance_names_the_gate_mismatch_as_its_reason(self, tmp_path, monkeypatch):
+        """End to end: cmd_advance_phase's JSON reason must say WHY, not just that the
+        advance failed -- capability 14's diagnosability requirement, observed here at
+        the one gate/reason pairing capability 8 names explicitly."""
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_advance_phase
+        from writ.session.cache import _read_cache, _write_cache
+        from writ.session.gate_token import mint_gate_token
+        from writ.session.locators import plan_md_hash
+
+        sid = _sid("cliname")
+        with _mint_cleanup(sid):
+            cache = _read_cache(sid)
+            cache.update({"mode": "work", "current_phase": "planning", "gates_approved": []})
+            _write_cache(sid, cache)
+            _write_plan(tmp_path)
+            current_hash = plan_md_hash(str(tmp_path))
+            # Bound to a DIFFERENT gate than the one actually pending (phase-a), with the
+            # CORRECT plan hash, so a gate mismatch is the only reason this claim can fail.
+            token = mint_gate_token(sid, gate="test-skeletons", plan_hash=current_hash)
+
+            result = _call_advance_json(monkeypatch, cmd_advance_phase, sid, str(tmp_path), token)
+            assert result["advanced"] is False
+            assert "gate" in result["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Capability 9: plan-fingerprint drift
+# ---------------------------------------------------------------------------
+
+
+class TestClaimRefusesPlanDrift:
+    def test_claim_is_refused_when_the_plan_hash_no_longer_matches(self):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+
+        sid = _sid("plandrift")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="hash-at-mint-time")
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash="hash-at-claim-time")
+            assert claimed is False
+
+    def test_a_checkbox_only_edit_between_mint_and_claim_is_accepted(self, tmp_path):
+        """locators.plan_md_hash normalizes checkbox tick state, so ticking a box after
+        mint (the documented way to close out a cycle) must not look like a pivot."""
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+        from writ.session.locators import plan_md_hash
+
+        sid = _sid("checkboxonly")
+        with _mint_cleanup(sid):
+            _write_plan(tmp_path, ticked=False)
+            hash_at_mint = plan_md_hash(str(tmp_path))
+            token = mint_gate_token(sid, gate="phase-a", plan_hash=hash_at_mint)
+
+            _write_plan(tmp_path, ticked=True)  # only the capability box's [ ] -> [x] changes
+            hash_at_claim = plan_md_hash(str(tmp_path))
+            assert hash_at_claim == hash_at_mint, "fixture drift: this edit must normalize to the SAME hash"
+
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash=hash_at_claim)
+            assert claimed is True
+
+    def test_a_substantive_edit_between_mint_and_claim_is_refused(self, tmp_path):
+        from writ.session.gate_token import claim_gate_token, mint_gate_token
+        from writ.session.locators import plan_md_hash
+
+        sid = _sid("substantive")
+        with _mint_cleanup(sid):
+            plan_path = _write_plan(tmp_path, ticked=False)
+            hash_at_mint = plan_md_hash(str(tmp_path))
+            token = mint_gate_token(sid, gate="phase-a", plan_hash=hash_at_mint)
+
+            plan_path.write_text(plan_path.read_text() + "\n- [ ] a second capability, added after mint\n")
+            hash_at_claim = plan_md_hash(str(tmp_path))
+            assert hash_at_claim != hash_at_mint, "fixture drift: adding a line must change the hash"
+
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash=hash_at_claim)
+            assert claimed is False
+
+
+# ---------------------------------------------------------------------------
+# Capability 10: legacy / unbound token file
+# ---------------------------------------------------------------------------
+
+
+class TestClaimRefusesUnboundLegacyToken:
+    def test_a_one_line_token_file_is_refused(self):
+        """The pre-cycle format: exactly what auto-approve-gate.sh wrote before this
+        cycle (`secrets.token_hex(16)` piped straight into the file, nothing else)."""
+        from writ.session.gate_token import claim_gate_token, gate_token_path
+
+        sid = _sid("legacy")
+        with _mint_cleanup(sid):
+            token = uuid.uuid4().hex
+            with open(gate_token_path(sid), "w") as f:
+                f.write(token + "\n")
+
+            claimed = claim_gate_token(sid, token, gate="phase-a", plan_hash="anything")
+            assert claimed is False
+
+    def test_the_cli_tells_the_user_to_approve_again_not_that_no_gate_is_pending(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_advance_phase
+        from writ.session.cache import _read_cache, _write_cache
+        from writ.session.gate_token import gate_token_path
+
+        sid = _sid("legacymsg")
+        with _mint_cleanup(sid):
+            cache = _read_cache(sid)
+            cache.update({"mode": "work", "current_phase": "planning", "gates_approved": []})
+            _write_cache(sid, cache)
+            _write_plan(tmp_path)
+            token = uuid.uuid4().hex
+            with open(gate_token_path(sid), "w") as f:
+                f.write(token + "\n")
+
+            result = _call_advance_json(monkeypatch, cmd_advance_phase, sid, str(tmp_path), token)
+            assert result["advanced"] is False
+            reason = result["reason"].lower()
+            assert "approve again" in reason or "re-approve" in reason or "reapprove" in reason
+            assert "no pending gate" not in reason and "no gate is pending" not in reason
+
+
+# ---------------------------------------------------------------------------
+# Capability 11: concurrent claims, real processes (ENF-SYS-005)
+# ---------------------------------------------------------------------------
+
+
+def _claim_worker(sid: str, token: str, gate: str, plan_hash: str, barrier, result_queue) -> None:
+    """Runs in a CHILD PROCESS. os.rename's atomicity guarantee is a cross-process
+    guarantee, and ENF-SYS-005 requires proving the claim primitive against real
+    concurrent OS processes racing a real file, not threads in one process sharing a
+    GIL or a mocked rename call."""
+    from writ.session.gate_token import claim_gate_token
+
+    barrier.wait()
+    result_queue.put(claim_gate_token(sid, token, gate=gate, plan_hash=plan_hash))
+
+
+class TestConcurrentClaimsRealProcesses:
+    def test_exactly_one_of_several_real_process_claims_wins(self):
+        from writ.session.gate_token import mint_gate_token
+
+        sid = _sid("realproc")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+
+            n = 6
+            ctx = multiprocessing.get_context("fork")
+            barrier = ctx.Barrier(n)
+            result_queue = ctx.Queue()
+            procs = [
+                ctx.Process(
+                    target=_claim_worker,
+                    args=(sid, token, "phase-a", "abc123def456", barrier, result_queue),
+                )
+                for _ in range(n)
+            ]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(timeout=15)
+
+            exit_codes = [p.exitcode for p in procs]
+            assert all(code == 0 for code in exit_codes), f"a worker process exited abnormally: {exit_codes}"
+
+            outcomes = [result_queue.get(timeout=5) for _ in range(n)]
+            assert outcomes.count(True) == 1, f"exactly one real-process claim must win; got {outcomes}"
+            assert outcomes.count(False) == n - 1
+
+
+# ---------------------------------------------------------------------------
+# Capability 12: promote-candidate route binding
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteCandidateBinding:
+    """/session/{id}/promote-candidate must refuse a token bound to a pending phase
+    gate (the cross-action confusion the plan calls out: a plan approval spent to
+    promote a decision-memory candidate) and accept one minted with gate="" (no phase
+    gate pending).
+
+    Third case added after cycle 1 shipped, as a DELIBERATE DEVIATION from plan.md,
+    which specified "A pre-binding token (no line 2 at all) is accepted as before" for
+    this route: an unbound token is now refused here too. Keeping it accepted left the
+    exact fail-open branch class this cycle deleted from the advance route sitting on the
+    route whose side effect is a bible/ canon write, so anything able to put one line
+    into /tmp/writ-gate-token-<sid> held an unbound approval for Writ's own memory.
+
+    A fourth case is a conversion, not a new property: tests/test_phase6_promote_route_
+    token.py::TestPromoteCandidateTokenGate::test_tokenless_promote_is_refused skipped
+    unconditionally on a live-daemon probe and never ran, and it was the one test in that
+    retired module with no other cover in this suite, so it moves here rather than
+    disappearing with the rest of the file."""
+
+    @pytest.mark.asyncio
+    async def test_a_token_bound_to_a_phase_gate_is_refused(self, monkeypatch):
+        import writ.server as server_module
+        from writ.server import SessionPromoteCandidateRequest
+        from writ.server.routes.gate import session_promote_candidate
+        from writ.session.gate_token import mint_gate_token
+
+        monkeypatch.setattr(server_module, "_db", object())
+        monkeypatch.setattr(server_module, "_pipeline", object())
+
+        sid = _sid("promote-refuse")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+
+            result = await session_promote_candidate(
+                sid, SessionPromoteCandidateRequest(candidate_id="cand-1", token=token)
+            )
+            assert result.get("promoted") is False
+            assert "gate" in (result.get("error") or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_a_token_minted_with_no_phase_gate_pending_is_accepted(self, monkeypatch):
+        import writ.promotion as promotion_module
+        import writ.server as server_module
+        from writ.server import SessionPromoteCandidateRequest
+        from writ.server.routes.gate import session_promote_candidate
+        from writ.session.gate_token import mint_gate_token
+
+        async def _stub_promote(*_args, **_kwargs):
+            return {"promoted": True, "graduated_via": "test-stub"}
+
+        monkeypatch.setattr(server_module, "_db", object())
+        monkeypatch.setattr(server_module, "_pipeline", object())
+        monkeypatch.setattr(promotion_module, "promote_candidate", _stub_promote)
+
+        sid = _sid("promote-accept")
+        with _mint_cleanup(sid):
+            # The candidate is now part of the binding (2026-08-25): this route used to
+            # take it from the request body alone, so one approval authorized promoting
+            # whichever candidate the caller named. An empty gate is still necessary and
+            # is what this test is about; it is no longer sufficient on its own.
+            token = mint_gate_token(sid, gate="", plan_hash="", candidate_id="cand-1")
+
+            result = await session_promote_candidate(
+                sid, SessionPromoteCandidateRequest(candidate_id="cand-1", token=token)
+            )
+            assert result.get("promoted") is True
+
+    @pytest.mark.asyncio
+    async def test_an_unbound_one_line_token_is_refused_before_any_canon_write(self, monkeypatch):
+        """The pre-binding one-line file: refused, with the reason the shared table owns.
+
+        promote_candidate is stubbed to report success, so the fail-open state this test
+        was written against does not merely return a different message -- it returns
+        promoted=True and records a call. That is what makes the assertion below about
+        the stub NOT being called the load-bearing one: the refusal has to happen before
+        the canon write, not be reported after it.
+        """
+        import writ.promotion as promotion_module
+        import writ.server as server_module
+        from writ.server import SessionPromoteCandidateRequest
+        from writ.server.routes.gate import session_promote_candidate
+        from writ.session.approval_workflow import _BINDING_REFUSAL_REASONS
+        from writ.session.gate_token import BINDING_UNBOUND, gate_token_path
+
+        promote_calls: list[tuple] = []
+        events: list[str] = []
+
+        async def _stub_promote(*args, **_kwargs):
+            promote_calls.append(args)
+            return {"promoted": True, "graduated_via": "test-stub"}
+
+        monkeypatch.setattr(server_module, "_db", object())
+        monkeypatch.setattr(server_module, "_pipeline", object())
+        monkeypatch.setattr(promotion_module, "promote_candidate", _stub_promote)
+        monkeypatch.setattr(
+            server_module, "log_friction_event",
+            lambda session_id=None, mode=None, event="", **extra: events.append(event),
+        )
+
+        sid = _sid("promote-unbound")
+        with _mint_cleanup(sid):
+            token = uuid.uuid4().hex
+            with open(gate_token_path(sid), "w") as f:
+                f.write(token + "\n")  # exactly what the pre-cycle writer wrote
+
+            result = await session_promote_candidate(
+                sid, SessionPromoteCandidateRequest(candidate_id="cand-1", token=token)
+            )
+            assert result.get("promoted") is False
+            assert promote_calls == [], (
+                "an unbound token must be refused BEFORE promote_candidate runs; a canon "
+                "write cannot be undone by a message"
+            )
+            # The reason text is the CLI's, so the two gate routes and the CLI cannot
+            # drift into describing one refusal three ways. Only the fixed prefix is
+            # pinned: the {target} the route fills in is its own wording.
+            error = result.get("error") or ""
+            reason_prefix = _BINDING_REFUSAL_REASONS[BINDING_UNBOUND].split("{target}")[0]
+            assert reason_prefix in error, (
+                f"the refusal must come from _BINDING_REFUSAL_REASONS[{BINDING_UNBOUND!r}]; "
+                f"got {error!r}"
+            )
+            assert "approve again" in error.lower()
+            # Capability 14 on this route: the unbound class is named in the log, so a
+            # fail-closed promotion gate is distinguishable from an absent token (which
+            # logs agent_self_approval_blocked) and from a phase-bound one.
+            assert BINDING_UNBOUND in events, (
+                f"the unbound refusal must log its own class; got {events}"
+            )
+            assert "candidate_promotion_gate_bound" not in events
+
+    @pytest.mark.asyncio
+    async def test_a_tokenless_promote_is_refused_before_any_canon_write(self, monkeypatch):
+        """Converted from tests/test_phase6_promote_route_token.py::
+        TestPromoteCandidateTokenGate::test_tokenless_promote_is_refused, retired for
+        skipping unconditionally on a live-daemon probe and never running. No token=
+        argument is passed at all, unlike the unbound sibling above, which writes a
+        one-line file; this test writes no token file, so it needs neither
+        _mint_cleanup nor the autouse leak fixture's forgiveness -- the fixture still
+        watches it.
+
+        REGRESSION ANCHOR, not a red-then-green step: the route already refuses a
+        tokenless promote, so this is green on arrival, exactly like
+        tests/test_daemon_client_coverage.py::TestNoAutostartLeavesThePortClosed.
+
+        The retired test's two assertions (`promoted is False`, and the word "token"
+        somewhere in the serialized result) cannot tell this refusal apart from the
+        UNBOUND refusal one arm downstream, and both hold even against a broken route:
+        weakening the absent-token arm at writ/server/routes/gate.py:468 from
+        `if not server.gate_token_valid(token, expected_token):` to
+        `if token and not server.gate_token_valid(token, expected_token):` lets a
+        tokenless request fall through to the binding read at line 527, which returns
+        promoted=False and a message that also contains "token" (BINDING_UNBOUND's
+        reason). So the discriminating assertions are the friction-log events, not the
+        response body: that mutation reddens the agent_self_approval_blocked /
+        BINDING_UNBOUND pair below, while the body assertions and promote_calls stay
+        green. `promote_calls == []` is carried as defense in depth, not as the
+        assertion that mutation moves: four independent arms in this route refuse a
+        tokenless promote (lines 468, 528, 546, 568), so no single-line mutation can
+        make `promoted` come back True or reach the promoter.
+        """
+        import writ.promotion as promotion_module
+        import writ.server as server_module
+        from writ.server import SessionPromoteCandidateRequest
+        from writ.server.routes.gate import session_promote_candidate
+        from writ.session.gate_token import BINDING_UNBOUND, gate_token_path
+
+        promote_calls: list[tuple] = []
+        events: list[str] = []
+
+        async def _stub_promote(*args, **_kwargs):
+            promote_calls.append(args)
+            return {"promoted": True, "graduated_via": "test-stub"}
+
+        monkeypatch.setattr(server_module, "_db", object())
+        monkeypatch.setattr(server_module, "_pipeline", object())
+        monkeypatch.setattr(promotion_module, "promote_candidate", _stub_promote)
+        monkeypatch.setattr(
+            server_module, "log_friction_event",
+            lambda session_id=None, mode=None, event="", **extra: events.append(event),
+        )
+
+        sid = _sid("promote-notoken")
+        assert not os.path.exists(gate_token_path(sid))
+
+        result = await session_promote_candidate(
+            sid, SessionPromoteCandidateRequest(candidate_id="cand-1")
+        )
+        assert result.get("promoted") is False
+        assert "token" in json.dumps(result).lower()
+        assert promote_calls == []
+        assert "agent_self_approval_blocked" in events
+        assert BINDING_UNBOUND not in events
+
+
+# ---------------------------------------------------------------------------
+# One snapshot read per authorization
+# ---------------------------------------------------------------------------
+
+_LINE_ONE = uuid.uuid4().hex
+
+# (label, file text, snapshot fields, which are also what each public reader returned before)
+_SNAPSHOT_FIXTURES = [
+    (
+        "seven",
+        f"{_LINE_ONE}\nphase-a\nhash123\ncand-1\nENF-RULE-001\nalice\nAlice A\n",
+        dict(secret=_LINE_ONE, gate="phase-a", plan_hash="hash123", candidate="cand-1",
+             rule="ENF-RULE-001", identity=("alice", "Alice A"), bound=True),
+    ),
+    (
+        "five",
+        f"{_LINE_ONE}\n\n\n\nENF-RULE-001\n",
+        dict(secret=_LINE_ONE, gate="", plan_hash="", candidate="",
+             rule="ENF-RULE-001", identity=("", ""), bound=True),
+    ),
+    (
+        "three",
+        f"{_LINE_ONE}\nphase-a\nhash123\n",
+        dict(secret=_LINE_ONE, gate="phase-a", plan_hash="hash123", candidate="",
+             rule="", identity=("", ""), bound=True),
+    ),
+    (
+        "one",
+        f"{_LINE_ONE}\n",
+        dict(secret=_LINE_ONE, gate="", plan_hash="", candidate="",
+             rule="", identity=("", ""), bound=False),
+    ),
+]
+
+
+class TestReadGateSnapshot:
+    @pytest.mark.parametrize("label, text, expected", _SNAPSHOT_FIXTURES,
+                             ids=[f[0] for f in _SNAPSHOT_FIXTURES])
+    def test_every_field_comes_from_one_read_with_empty_for_missing_lines(
+        self, label, text, expected,
+    ):
+        from writ.session.gate_token import GateIdentity, gate_token_path, read_gate_snapshot
+
+        sid = _sid(f"snap-{label}")
+        with _mint_cleanup(sid):
+            Path(gate_token_path(sid)).write_text(text)
+            snap = read_gate_snapshot(sid)
+        assert snap is not None
+        assert snap.secret == expected["secret"]
+        assert snap.gate == expected["gate"]
+        assert snap.plan_hash == expected["plan_hash"]
+        assert snap.candidate == expected["candidate"]
+        assert snap.rule == expected["rule"]
+        assert snap.identity == GateIdentity(*expected["identity"])
+        assert snap.bound is expected["bound"]
+
+    def test_a_three_line_file_without_a_trailing_newline_is_still_bound(self):
+        from writ.session.gate_token import gate_token_path, read_gate_snapshot
+
+        sid = _sid("snap-nonl")
+        with _mint_cleanup(sid):
+            Path(gate_token_path(sid)).write_text(f"{_LINE_ONE}\nphase-a\nhash123")
+            snap = read_gate_snapshot(sid)
+        assert snap is not None and snap.bound is True
+        assert (snap.gate, snap.plan_hash, snap.candidate) == ("phase-a", "hash123", "")
+
+    def test_an_absent_file_is_none(self):
+        from writ.session.gate_token import gate_token_path, read_gate_snapshot
+
+        sid = _sid("snap-absent")
+        assert not os.path.exists(gate_token_path(sid))
+        assert read_gate_snapshot(sid) is None
+
+    def test_an_unreadable_file_is_none(self, tmp_path, monkeypatch):
+        from writ.session.gate_token import read_gate_snapshot
+
+        token_dir = tmp_path / "token-is-a-dir"
+        token_dir.mkdir()
+        monkeypatch.setattr("writ.session.gate_token.gate_token_path", lambda _sid: str(token_dir))
+        assert read_gate_snapshot("sid-unreadable") is None
+
+    def test_reading_the_snapshot_does_not_consume_the_token(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token, read_gate_snapshot
+
+        sid = _sid("snap-keeps")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", os_login="a", git_name="b")
+            read_gate_snapshot(sid)
+            assert os.path.exists(gate_token_path(sid))
+
+    def test_the_route_seam_re_exports_it(self):
+        import writ.server as server_module
+        from writ.session.gate_token import read_gate_snapshot
+
+        assert server_module.read_gate_snapshot is read_gate_snapshot
+
+
+class TestPublicReadersAreProjectionsOfTheSnapshot:
+    @pytest.mark.parametrize("label, text, expected", _SNAPSHOT_FIXTURES,
+                             ids=[f[0] for f in _SNAPSHOT_FIXTURES])
+    def test_each_reader_returns_what_it_always_returned(self, label, text, expected):
+        from writ.session.gate_token import (
+            gate_token_path,
+            read_gate_binding,
+            read_gate_candidate,
+            read_gate_identity,
+            read_gate_rule,
+            read_gate_token,
+        )
+
+        sid = _sid(f"proj-{label}")
+        with _mint_cleanup(sid):
+            Path(gate_token_path(sid)).write_text(text)
+            assert read_gate_token(sid) == expected["secret"]
+            binding = read_gate_binding(sid)
+            assert read_gate_candidate(sid) == expected["candidate"]
+            assert read_gate_rule(sid) == expected["rule"]
+            assert tuple(read_gate_identity(sid)) == expected["identity"]
+        if expected["bound"]:
+            assert binding == (expected["gate"], expected["plan_hash"])
+        else:
+            assert binding is None
+
+    def test_every_reader_returns_its_empty_value_for_an_absent_file(self):
+        from writ.session.gate_token import (
+            gate_token_path,
+            read_gate_binding,
+            read_gate_candidate,
+            read_gate_identity,
+            read_gate_rule,
+            read_gate_token,
+        )
+
+        sid = _sid("proj-absent")
+        assert not os.path.exists(gate_token_path(sid))
+        assert read_gate_token(sid) == ""
+        assert read_gate_binding(sid) is None
+        assert read_gate_candidate(sid) == ""
+        assert read_gate_rule(sid) == ""
+        assert tuple(read_gate_identity(sid)) == ("", "")
+
+    def test_the_readers_agree_with_the_snapshot_for_a_minted_token(self):
+        from writ.session.gate_token import (
+            mint_gate_token,
+            read_gate_binding,
+            read_gate_candidate,
+            read_gate_identity,
+            read_gate_rule,
+            read_gate_snapshot,
+            read_gate_token,
+        )
+
+        sid = _sid("proj-minted")
+        with _mint_cleanup(sid):
+            mint_gate_token(
+                sid, gate="", plan_hash="h", candidate_id="c-9", rule_id="ENF-X-001",
+                os_login="bob", git_name="Bob B",
+            )
+            snap = read_gate_snapshot(sid)
+            assert read_gate_token(sid) == snap.secret
+            assert read_gate_binding(sid) == (snap.gate, snap.plan_hash)
+            assert read_gate_candidate(sid) == snap.candidate
+            assert read_gate_rule(sid) == snap.rule
+            assert read_gate_identity(sid) == snap.identity
+
+
+class TestAbsentAndUnreadableTokenInstrumentation:
+    @pytest.fixture()
+    def emitted(self, monkeypatch):
+        rows: list[str] = []
+        monkeypatch.setattr(
+            "writ.shared.logging.emit_exception",
+            lambda component, *a, **k: rows.append(component),
+        )
+        return rows
+
+    def test_an_absent_file_emits_nothing_through_any_reader_or_the_claim(self, emitted):
+        from writ.session import gate_token as gt
+
+        sid = _sid("instr-absent")
+        assert not os.path.exists(gt.gate_token_path(sid))
+        gt.read_gate_snapshot(sid)
+        gt.read_gate_token(sid)
+        gt.read_gate_binding(sid)
+        gt.read_gate_candidate(sid)
+        gt.read_gate_rule(sid)
+        gt.read_gate_identity(sid)
+        assert gt.claim_gate_token(sid, "x", gate="", plan_hash="") is False
+        assert emitted == []
+
+    def test_a_present_but_unreadable_file_emits_a_gate_token_read_row(
+        self, emitted, tmp_path, monkeypatch,
+    ):
+        from writ.session.gate_token import read_gate_snapshot
+
+        token_dir = tmp_path / "token-is-a-dir"
+        token_dir.mkdir()
+        monkeypatch.setattr("writ.session.gate_token.gate_token_path", lambda _sid: str(token_dir))
+        assert read_gate_snapshot("sid-instr") is None
+        assert "session.gate_token.read" in emitted
+
+    def test_a_non_utf8_byte_fails_closed_like_an_unreadable_file(
+        self, emitted, tmp_path, monkeypatch,
+    ):
+        from writ.session.gate_token import read_gate_snapshot, read_gate_token
+
+        token = tmp_path / "token"
+        token.write_bytes(b"secret\n\nhash\n\n\nlogin\n\xff\xfe\n")
+        monkeypatch.setattr("writ.session.gate_token.gate_token_path", lambda _sid: str(token))
+        assert read_gate_snapshot("sid-instr") is None
+        assert read_gate_token("sid-instr") == ""
+        assert "session.gate_token.read" in emitted
+
+
+class TestPromoteCandidateRaceLoser:
+    """The route's loser: its token is claimed by another party (the real rename) right
+    after the route's first token-file read."""
+
+    @staticmethod
+    def _wire(monkeypatch, sid, *, claim_after_first: bool, after_first=None):
+        import writ.promotion as promotion_module
+        import writ.server as server_module
+        import writ.session.gate_token as gt
+
+        promote_calls: list[tuple] = []
+        events: list[str] = []
+        approvals: list[dict] = []
+
+        async def _stub_promote(*args, **_kwargs):
+            promote_calls.append(args)
+            return {"promoted": True, "graduated_via": "test-stub"}
+
+        async def _stub_record_approval(_db, candidate_id, **kwargs):
+            approvals.append({"candidate_id": candidate_id, **kwargs})
+
+        monkeypatch.setattr(server_module, "_db", object())
+        monkeypatch.setattr(server_module, "_pipeline", object())
+        monkeypatch.setattr(promotion_module, "promote_candidate", _stub_promote)
+        monkeypatch.setattr("writ.authoring.record_approval", _stub_record_approval)
+        monkeypatch.setattr(
+            server_module, "log_friction_event",
+            lambda session_id=None, mode=None, event="", **extra: events.append(event),
+        )
+
+        real = gt._token_file_lines
+        state = {"calls": 0}
+
+        def wrapper(session_id):
+            lines = real(session_id)
+            if session_id == sid:
+                state["calls"] += 1
+                if state["calls"] == 1:
+                    if after_first is not None:
+                        after_first()
+                    elif claim_after_first:
+                        gt._claim_file(sid)
+            return lines
+
+        monkeypatch.setattr(gt, "_token_file_lines", wrapper)
+        return promote_calls, events, approvals
+
+    @pytest.mark.asyncio
+    async def test_a_token_claimed_after_the_snapshot_read_is_refused_as_already_spent(
+        self, monkeypatch,
+    ):
+        from writ.server import SessionPromoteCandidateRequest
+        from writ.server.routes.gate import session_promote_candidate
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("promote-race")
+        promote_calls, events, _approvals = self._wire(monkeypatch, sid, claim_after_first=True)
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="", plan_hash="", candidate_id="cand-1")
+
+            result = await session_promote_candidate(
+                sid, SessionPromoteCandidateRequest(candidate_id="cand-1", token=token)
+            )
+
+            assert not os.path.exists(gate_token_path(sid))
+        assert result == {
+            "promoted": False,
+            "error": (
+                "That approval was already spent (a concurrent request claimed it). "
+                "One approval authorizes exactly one promotion."
+            ),
+        }
+        assert "gate_token_unbound" not in events, events
+        assert "gate_token_candidate_mismatch" not in events, events
+        assert promote_calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_approver_is_the_identity_in_the_checked_bytes(self, monkeypatch):
+        from writ.server import SessionPromoteCandidateRequest
+        from writ.server.routes.gate import session_promote_candidate
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("promote-ident")
+
+        def swap_identity():
+            lines = Path(gate_token_path(sid)).read_text().split("\n")
+            lines[5], lines[6] = "mallory-swapped", "Mallory Swapped"
+            Path(gate_token_path(sid)).write_text("\n".join(lines))
+
+        promote_calls, _events, approvals = self._wire(
+            monkeypatch, sid, claim_after_first=False, after_first=swap_identity,
+        )
+        with _mint_cleanup(sid):
+            token = mint_gate_token(
+                sid, gate="", plan_hash="", candidate_id="cand-1",
+                os_login=FIXED_LOGIN, git_name=FIXED_GIT_NAME,
+            )
+            result = await session_promote_candidate(
+                sid, SessionPromoteCandidateRequest(candidate_id="cand-1", token=token)
+            )
+
+        assert result.get("promoted") is True
+        assert len(promote_calls) == 1
+        assert len(approvals) == 1, approvals
+        identity = approvals[0]["identity"]
+        assert (identity.os_login, identity.git_name) == (FIXED_LOGIN, FIXED_GIT_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Capability 13: cmd_current_phase reports next_gate + plan_hash
+# ---------------------------------------------------------------------------
+
+
+class TestCmdCurrentPhaseReportsBinding:
+    """None of these mint a gate token (only a session cache), so none need
+    _mint_cleanup or trip the autouse leak guard."""
+
+    def test_reports_the_next_pending_gate(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_current_phase
+        from writ.session.cache import _read_cache, _write_cache
+
+        sid = _sid("nextgate")
+        _write_plan(tmp_path)
+        cache = _read_cache(sid)
+        cache.update({
+            "mode": "work", "current_phase": "planning", "gates_approved": [],
+            "project_root": str(tmp_path),
+        })
+        _write_cache(sid, cache)
+
+        result = _call_json(cmd_current_phase, sid)
+        assert result["next_gate"] == "phase-a"
+
+    def test_reports_the_plan_hash(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_current_phase
+        from writ.session.cache import _read_cache, _write_cache
+        from writ.session.locators import plan_md_hash
+
+        sid = _sid("planhash")
+        _write_plan(tmp_path)
+        expected = plan_md_hash(str(tmp_path))
+        cache = _read_cache(sid)
+        cache.update({
+            "mode": "work", "current_phase": "planning", "gates_approved": [],
+            "project_root": str(tmp_path),
+        })
+        _write_cache(sid, cache)
+
+        result = _call_json(cmd_current_phase, sid)
+        assert result["plan_hash"] == expected
+
+    def test_next_gate_is_null_when_no_gate_is_pending(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_current_phase
+        from writ.session.cache import _read_cache, _write_cache
+
+        sid = _sid("nogatepending")
+        cache = _read_cache(sid)
+        cache.update({
+            "mode": "work", "current_phase": "implementation",
+            "gates_approved": ["phase-a", "test-skeletons"],
+            "project_root": str(tmp_path),
+        })
+        _write_cache(sid, cache)
+
+        result = _call_json(cmd_current_phase, sid)
+        assert result["next_gate"] is None
+
+    def test_plan_hash_is_null_when_there_is_no_plan_md(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.session.approval_workflow import cmd_current_phase
+        from writ.session.cache import _read_cache, _write_cache
+
+        sid = _sid("noplan")
+        cache = _read_cache(sid)
+        cache.update({
+            "mode": "work", "current_phase": "planning", "gates_approved": [],
+            "project_root": str(tmp_path),  # no plan.md written here
+        })
+        _write_cache(sid, cache)
+
+        result = _call_json(cmd_current_phase, sid)
+        assert result["plan_hash"] is None
+
+
+# ---------------------------------------------------------------------------
+# Capability 14: one friction event per refusal class
+# ---------------------------------------------------------------------------
+
+
+class TestFrictionEventPerRefusalClass:
+    """Each of the three NEW refusal classes (gate mismatch, plan drift, unbound
+    legacy token) must be distinguishable in the friction log from one another --
+    otherwise a fail-closed gate reads identically to an absent one, which is the
+    defect capability 14 exists to close."""
+
+    def _advance_and_capture(self, tmp_path, monkeypatch, sid: str, token_body: str) -> tuple[dict, list[str]]:
+        import writ.session.approval_workflow as aw
+        from writ.session.cache import _read_cache, _write_cache
+        from writ.session.gate_token import gate_token_path
+
+        cache = _read_cache(sid)
+        cache.update({"mode": "work", "current_phase": "planning", "gates_approved": []})
+        _write_cache(sid, cache)
+
+        with _mint_cleanup(sid):
+            with open(gate_token_path(sid), "w") as f:
+                f.write(token_body)
+
+            events: list[str] = []
+            monkeypatch.setattr(
+                aw, "_log_friction_event",
+                lambda session_id, mode, event, **extra: events.append(event),
+            )
+            result = _call_advance_json(
+                monkeypatch, aw.cmd_advance_phase, sid, str(tmp_path), token_body.splitlines()[0]
+            )
+            return result, events
+
+    def test_gate_mismatch_plan_drift_and_unbound_log_three_distinct_events(self, tmp_path, monkeypatch):
+        from writ.session.locators import plan_md_hash
+
+        _write_plan(tmp_path)
+        current_hash = plan_md_hash(str(tmp_path))
+
+        result_gate, events_gate = self._advance_and_capture(
+            tmp_path, monkeypatch, _sid("friction-gate"),
+            token_body=f"{uuid.uuid4().hex}\ntest-skeletons\n{current_hash}\n",
+        )
+        result_plan, events_plan = self._advance_and_capture(
+            tmp_path, monkeypatch, _sid("friction-plan"),
+            token_body=f"{uuid.uuid4().hex}\nphase-a\nstale-hash-value\n",
+        )
+        result_legacy, events_legacy = self._advance_and_capture(
+            tmp_path, monkeypatch, _sid("friction-legacy"),
+            token_body=f"{uuid.uuid4().hex}\n",
+        )
+
+        for label, result in (("gate", result_gate), ("plan", result_plan), ("legacy", result_legacy)):
+            assert result["advanced"] is False, f"{label} mismatch must refuse the advance: {result}"
+
+        def _only_refusal_event(events: list[str], label: str) -> str:
+            candidates = [e for e in events if e != "phase_token_summary"]
+            assert len(candidates) == 1, f"{label}: expected exactly one refusal friction event, got {events}"
+            return candidates[0]
+
+        e_gate = _only_refusal_event(events_gate, "gate-mismatch")
+        e_plan = _only_refusal_event(events_plan, "plan-drift")
+        e_legacy = _only_refusal_event(events_legacy, "unbound-legacy")
+
+        assert len({e_gate, e_plan, e_legacy}) == 3, (
+            "each refusal class must log a distinctly-named friction event; "
+            f"got gate={e_gate!r} plan={e_plan!r} legacy={e_legacy!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Capability 15: spend-on-rejection / no-spend-on-unresolved-root, unchanged
+# ---------------------------------------------------------------------------
+
+
+class TestSpendBehaviorUnchangedByTheBindingChange:
+    """Both scenarios are already proven against the OLD claim_gate_token signature by
+    tests/test_advance_phase_token_claim.py::TestPreservedBehaviorGuards; these re-run
+    them through mint_gate_token so a regression introduced BY adding the gate=/
+    plan_hash= binding is caught here too. RED today for an incidental reason only:
+    mint_gate_token does not exist yet. The underlying spend/no-spend behavior itself
+    is already correct and is not expected to change.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_phase_a_rejection_still_spends_the_token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.server import SessionAdvancePhaseRequest, session_advance_phase
+        from writ.session.cache import _read_cache, _write_cache
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("rejectionspend")
+        with _mint_cleanup(sid):
+            cache = _read_cache(sid)
+            cache.update({"mode": "work", "current_phase": "planning", "gates_approved": []})
+            _write_cache(sid, cache)
+            empty_project = tmp_path / "empty_project"
+            empty_project.mkdir()  # deliberately no plan.md: phase-a validation must fail
+
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="")
+            result = await session_advance_phase(
+                sid,
+                SessionAdvancePhaseRequest(
+                    confirmation_source="explicit", token=token, project_root=str(empty_project),
+                ),
+            )
+            assert result.get("advanced") is False
+            assert result.get("gate") == "phase-a"
+            assert not os.path.exists(gate_token_path(sid)), (
+                "a phase-a validation rejection must still consume the spent token"
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_project_root_does_not_spend_the_token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path / "cache"))
+        (tmp_path / "cache").mkdir()
+        from writ.server import SessionAdvancePhaseRequest, session_advance_phase
+        from writ.session.cache import _read_cache, _write_cache
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("noroot")
+        with _mint_cleanup(sid):
+            cache = _read_cache(sid)
+            cache.update({"mode": "work", "current_phase": "planning", "gates_approved": []})
+            _write_cache(sid, cache)
+
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="")
+            # No project_root, no cwd -> resolve_project_root returns ("", "none").
+            result = await session_advance_phase(
+                sid, SessionAdvancePhaseRequest(confirmation_source="explicit", token=token),
+            )
+            assert result.get("advanced") is False
+            assert result.get("token_spent") is False
+            assert os.path.exists(gate_token_path(sid)), (
+                "an unresolvable project root must NOT spend the token -- the user can "
+                "retry from the project directory without re-approving"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Finding 3 (plan.md 2412ba38-51e1-4b73-895b-7b240a3c21d3): the token's field count,
+# derived from the mint's own signature.
+#
+# HANDBOOK.md section 7 says the token is four lines; the mint writes five, because the
+# rule id was added after that sentence was written. The sentence is corrected by reading
+# the doc, NEVER by a test: this repo forbids tests that assert on documentation prose and
+# a standing user ruling records it, so nothing below reads a markdown file. The structural
+# guard goes on the ARTIFACT instead, where a future line added without a binding field (or
+# a binding field added without a line) fails on its own.
+#
+# NO COUNT LITERAL. The expected number comes from `inspect.signature(mint_gate_token)`,
+# which is the single source that actually decides what a token can bind.
+# ---------------------------------------------------------------------------
+
+
+def _binding_parameters() -> list[str]:
+    """Every parameter of `mint_gate_token` that names a LINE of the token file.
+
+    `session_id` is excluded by name and for a stated reason: it names the FILE
+    (`gate_token_path`), not a field inside it. Triage rule, per the plan: if a future
+    parameter is deliberately not a line, exclude it here by name with the reason. Do not
+    replace this derivation with a number, which is the drift the derivation exists to
+    catch.
+    """
+    import inspect
+
+    from writ.session.gate_token import mint_gate_token
+
+    names = [
+        name for name in inspect.signature(mint_gate_token).parameters
+        if name != "session_id"
+    ]
+    assert names, (
+        "mint_gate_token declares no binding parameter at all, so the expected field "
+        "count derived here is zero and every assertion below would pass on any token"
+    )
+    return names
+
+
+def _token_fields(text: str) -> list[str]:
+    """The token file's fields. `splitlines` keeps an EMPTY trailing field, which matters:
+    an unbound candidate or rule is written as an empty line and still occupies one."""
+    return text.splitlines()
+
+
+class TestTokenFieldCountMatchesTheMintSignature:
+    """Capabilities 13 to 15. One line per binding field, both writers agreeing, and the
+    guard proved conditional against a token with a field missing.
+
+    TRIAGE RULE FOR A RED HERE, stated where whoever meets it will read it: either a
+    binding field was added without a line, or a line was added without a field. Both are
+    real defects in the approval binding. Fixing it by writing the observed number into
+    this file removes the only thing that would notice next time.
+    """
+
+    def test_a_minted_token_carries_one_line_per_binding_parameter(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        expected = _binding_parameters()
+        sid = _sid("fieldcount")
+        with _mint_cleanup(sid):
+            mint_gate_token(
+                sid, gate="phase-a", plan_hash="abc123def456",
+                candidate_id="CAND-1", rule_id="ENF-TEST-003",
+            )
+            fields = _token_fields(Path(gate_token_path(sid)).read_text())
+
+        assert len(fields) == len(expected), (
+            f"mint_gate_token accepts the binding fields {expected} but wrote "
+            f"{len(fields)} line(s): {fields!r}"
+        )
+
+    def test_an_unbound_mint_still_carries_one_line_per_binding_parameter(self):
+        """The common case: a phase advance binds no candidate and no rule, and those
+        fields are written as EMPTY lines rather than omitted. A count taken from a
+        stripped read would see fewer lines here and call the token short."""
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        expected = _binding_parameters()
+        sid = _sid("fieldcount-empty")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            fields = _token_fields(Path(gate_token_path(sid)).read_text())
+
+        assert len(fields) == len(expected), (
+            f"an ordinary phase approval wrote {len(fields)} line(s) where "
+            f"mint_gate_token accepts {len(expected)} binding fields: {fields!r}"
+        )
+
+    def test_the_bash_writer_produces_the_same_field_count(self, tmp_path, monkeypatch):
+        """Capability 14. The hook mints from bash so a broken writ package cannot cost the
+        user their approval, which means two writers own one format. Both are driven with
+        the SAME inputs and counted the same way, so neither can gain or lose a field
+        without this failing."""
+        import writ.session.gate_token as gt
+
+        expected = _binding_parameters()
+        sid = _sid("fieldcount-parity")
+        fixed_token = uuid.uuid4().hex
+        py_path = tmp_path / "py-token"
+        bash_path = tmp_path / "bash-token"
+
+        monkeypatch.setattr(gt, "gate_token_path", lambda session_id: str(py_path))
+        gt.mint_gate_token(
+            sid, gate="phase-a", plan_hash="0123456789ab",
+            candidate_id="CAND-1", rule_id="ENF-TEST-003", token=fixed_token,
+        )
+
+        script = (
+            f'set -euo pipefail\nsource "{COMMON_SH}"\n'
+            f'write_gate_token_file "{bash_path}" "{fixed_token}" "phase-a" '
+            f'"0123456789ab" "CAND-1" "ENF-TEST-003"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        assert r.returncode == 0, f"write_gate_token_file failed: {r.stderr}"
+
+        python_fields = _token_fields(py_path.read_text())
+        bash_fields = _token_fields(bash_path.read_text())
+
+        assert len(bash_fields) == len(python_fields), (
+            f"the bash writer wrote {len(bash_fields)} field(s) and the python mint wrote "
+            f"{len(python_fields)}: {bash_fields!r} vs {python_fields!r}"
+        )
+        assert len(bash_fields) == len(expected), (
+            f"both writers agree on {len(bash_fields)} field(s), and mint_gate_token "
+            f"accepts the binding fields {expected}"
+        )
+
+    def test_the_guard_reports_a_token_that_is_one_field_short(self):
+        """Capability 15. A count that answered 'right' for any token would pass every case
+        above on any tree. The synthetic token drops the LAST field, which is the shape the
+        rule-id line was added into."""
+        expected = _binding_parameters()
+        short = "\n".join(f"field{index}" for index in range(len(expected) - 1)) + "\n"
+
+        assert len(_token_fields(short)) != len(expected), (
+            "a token one field short counted as complete, so this guard cannot tell a "
+            f"drifted writer from a correct one: {short!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Program item 6 (attribution and trust records), workstream R: identity on the token.
+#
+# Lines 6 and 7 of the gate token carry WHO approved: the OS login (the anchor, the
+# agent cannot change it) and the global git user.name (display only). They are captured
+# by the process that mints the token, never taken from an agent argument, and they are
+# NOT a binding: _binding_refusal still compares lines 2 to 5 only.
+#
+# RED today: mint_gate_token has no os_login / git_name parameters and writes five lines,
+# write_gate_token_file writes five lines and ignores arguments 7 and 8, and GateIdentity,
+# read_gate_identity and rule_action_binding do not exist in writ.session.gate_token.
+#
+# IDENTITY VALUES ARE CONTROLLED, never the real machine's. Explicit arguments carry fixed
+# strings; capture tests point GIT_CONFIG_GLOBAL at a file this test wrote, and compare the
+# OS login only against what this very process reports (pwd, the same source `id -un` reads).
+# ---------------------------------------------------------------------------
+
+FIXED_LOGIN = "alice-fixed"
+FIXED_GIT_NAME = "Alice Fixed Name"
+
+
+def _process_login() -> str:
+    """The OS login as this process itself reports it, and nothing more specific."""
+    import pwd
+
+    return pwd.getpwuid(os.geteuid()).pw_name
+
+
+def _gitconfig_path(tmp_path, name: str | None) -> str:
+    """A global git config naming `name`, or a path that does not exist when None."""
+    path = tmp_path / "gitconfig"
+    if name is not None:
+        path.write_text(f"[user]\n\tname = {name}\n")
+    return str(path)
+
+
+def _bash_write(tmp_path, *args: str, env_extra: dict | None = None) -> bytes:
+    """Drive write_gate_token_file with exactly `args` (path first) and return the bytes."""
+    quoted = " ".join(f'"{a}"' for a in args)
+    script = f'set -euo pipefail\nsource "{COMMON_SH}"\nwrite_gate_token_file {quoted}\n'
+    env = {**os.environ, **(env_extra or {})}
+    r = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=20, env=env,
+    )
+    assert r.returncode == 0, f"write_gate_token_file failed: {r.stderr}"
+    return Path(args[0]).read_bytes()
+
+
+class TestTokenIdentityLines:
+    """Line 6 the OS login, line 7 the global git name, in BOTH writers."""
+
+    def test_mint_writes_explicit_identity_on_lines_six_and_seven(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        sid = _sid("ident-explicit")
+        with _mint_cleanup(sid):
+            mint_gate_token(
+                sid, gate="", plan_hash="", rule_id="ENF-TEST-001",
+                os_login=FIXED_LOGIN, git_name=FIXED_GIT_NAME,
+            )
+            lines = Path(gate_token_path(sid)).read_text().split("\n")
+        assert lines[4] == "ENF-TEST-001"
+        assert lines[5] == FIXED_LOGIN
+        assert lines[6] == FIXED_GIT_NAME
+
+    def test_mint_captures_the_process_login_and_global_git_name_when_not_given(
+        self, tmp_path, monkeypatch,
+    ):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", _gitconfig_path(tmp_path, FIXED_GIT_NAME))
+        sid = _sid("ident-capture")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-TEST-001")
+            lines = Path(gate_token_path(sid)).read_text().split("\n")
+        assert lines[5] == _process_login()
+        assert lines[6] == FIXED_GIT_NAME
+
+    def test_mint_writes_an_empty_line_seven_when_no_git_name_is_configured(
+        self, tmp_path, monkeypatch,
+    ):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", _gitconfig_path(tmp_path, None))
+        sid = _sid("ident-nogit")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="")
+            lines = Path(gate_token_path(sid)).read_text().split("\n")
+        assert lines[5] == _process_login()
+        assert lines[6] == ""
+
+    def test_an_explicit_empty_git_name_is_written_as_empty_not_captured(
+        self, tmp_path, monkeypatch,
+    ):
+        """None means capture; "" means the caller said empty. A configured name must not
+        leak in behind an explicit empty value."""
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", _gitconfig_path(tmp_path, FIXED_GIT_NAME))
+        sid = _sid("ident-emptygit")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", os_login=FIXED_LOGIN, git_name="")
+            lines = Path(gate_token_path(sid)).read_text().split("\n")
+        assert lines[5] == FIXED_LOGIN
+        assert lines[6] == ""
+
+    def test_bash_writer_matches_python_byte_for_byte_with_explicit_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        import writ.session.gate_token as gt
+
+        fixed_token = uuid.uuid4().hex
+        py_path = tmp_path / "py-token"
+        monkeypatch.setattr(gt, "gate_token_path", lambda session_id: str(py_path))
+        gt.mint_gate_token(
+            _sid("ident-parity"), gate="", plan_hash="", candidate_id="", rule_id="ENF-TEST-002",
+            os_login=FIXED_LOGIN, git_name=FIXED_GIT_NAME, token=fixed_token,
+        )
+        bash_bytes = _bash_write(
+            tmp_path, str(tmp_path / "bash-token"), fixed_token, "", "", "", "ENF-TEST-002",
+            FIXED_LOGIN, FIXED_GIT_NAME,
+        )
+        assert py_path.read_bytes() == bash_bytes, (
+            f"python: {py_path.read_bytes()!r}\nbash:   {bash_bytes!r}"
+        )
+
+    def test_bash_writer_matches_python_byte_for_byte_with_an_explicit_empty_git_name(
+        self, tmp_path, monkeypatch,
+    ):
+        import writ.session.gate_token as gt
+
+        fixed_token = uuid.uuid4().hex
+        py_path = tmp_path / "py-token"
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", _gitconfig_path(tmp_path, FIXED_GIT_NAME))
+        monkeypatch.setattr(gt, "gate_token_path", lambda session_id: str(py_path))
+        gt.mint_gate_token(
+            _sid("ident-parity-empty"), gate="", plan_hash="", rule_id="ENF-TEST-002",
+            os_login=FIXED_LOGIN, git_name="", token=fixed_token,
+        )
+        bash_bytes = _bash_write(
+            tmp_path, str(tmp_path / "bash-token"), fixed_token, "", "", "", "ENF-TEST-002",
+            FIXED_LOGIN, "",
+            env_extra={"GIT_CONFIG_GLOBAL": _gitconfig_path(tmp_path, FIXED_GIT_NAME)},
+        )
+        assert py_path.read_bytes() == bash_bytes
+        assert bash_bytes.decode().split("\n")[6] == ""
+
+    def test_both_writers_capture_the_same_identity_for_the_same_environment(
+        self, tmp_path, monkeypatch,
+    ):
+        import writ.session.gate_token as gt
+
+        config = _gitconfig_path(tmp_path, FIXED_GIT_NAME)
+        fixed_token = uuid.uuid4().hex
+        py_path = tmp_path / "py-token"
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", config)
+        monkeypatch.setattr(gt, "gate_token_path", lambda session_id: str(py_path))
+        gt.mint_gate_token(
+            _sid("ident-env"), gate="phase-a", plan_hash="0123456789ab", token=fixed_token,
+        )
+        bash_bytes = _bash_write(
+            tmp_path, str(tmp_path / "bash-token"), fixed_token, "phase-a", "0123456789ab",
+            env_extra={"GIT_CONFIG_GLOBAL": config},
+        )
+        assert py_path.read_bytes() == bash_bytes
+        lines = bash_bytes.decode().split("\n")
+        assert lines[5] == _process_login()
+        assert lines[6] == FIXED_GIT_NAME
+
+    def test_bash_writer_with_no_git_name_configured_writes_an_empty_line_seven(self, tmp_path):
+        out = _bash_write(
+            tmp_path, str(tmp_path / "bash-token"), uuid.uuid4().hex, "", "",
+            env_extra={"GIT_CONFIG_GLOBAL": _gitconfig_path(tmp_path, None)},
+        )
+        lines = out.decode().split("\n")
+        assert lines[5] == _process_login()
+        assert lines[6] == ""
+
+
+class TestHookMintSitesCaptureIdentityThemselves:
+    """Capability 25. Production identity is captured by the hook process at mint, so no
+    call site in the approval hook may hand the writer an identity of its own."""
+
+    HOOK = os.path.join(SKILL_ROOT, "hooks", "scripts", "auto-approve-gate.sh")
+
+    def _call_sites(self) -> list[list[str]]:
+        import shlex
+
+        text = Path(self.HOOK).read_text().replace("\\\n", " ")
+        sites = []
+        for raw in text.split("\n"):
+            stripped = raw.strip()
+            if stripped.startswith("#") or not stripped.startswith("write_gate_token_file "):
+                continue
+            sites.append(shlex.split(stripped, comments=True)[1:])
+        return sites
+
+    def test_the_hook_still_has_exactly_the_two_known_mint_sites(self):
+        sites = self._call_sites()
+        assert len(sites) == 2, (
+            f"expected the replan and the exact/override mint sites; found {sites!r}"
+        )
+
+    def test_no_mint_site_passes_a_seventh_or_eighth_argument(self):
+        for args in self._call_sites():
+            assert len(args) <= 6, (
+                f"a hook mint site passes {len(args)} arguments {args!r}; arguments 7 and 8 "
+                "are the identity, which only a test may supply"
+            )
+
+
+class TestReadGateIdentity:
+    def test_gate_identity_is_a_two_field_record_in_line_order(self):
+        from writ.session.gate_token import GateIdentity
+
+        assert GateIdentity._fields == ("os_login", "git_name")
+        assert GateIdentity("a", "b") == ("a", "b")
+
+    def test_reads_the_identity_the_mint_wrote(self):
+        from writ.session.gate_token import mint_gate_token, read_gate_identity
+
+        sid = _sid("readident")
+        with _mint_cleanup(sid):
+            mint_gate_token(
+                sid, gate="", plan_hash="", rule_id="ENF-TEST-001",
+                os_login=FIXED_LOGIN, git_name=FIXED_GIT_NAME,
+            )
+            identity = read_gate_identity(sid)
+        assert identity.os_login == FIXED_LOGIN
+        assert identity.git_name == FIXED_GIT_NAME
+
+    def test_an_absent_token_file_reads_empty_identity(self):
+        from writ.session.gate_token import gate_token_path, read_gate_identity
+
+        sid = _sid("readident-absent")
+        assert not os.path.exists(gate_token_path(sid))
+        identity = read_gate_identity(sid)
+        assert identity.os_login == ""
+        assert identity.git_name == ""
+
+    def test_a_five_line_token_reads_empty_identity(self):
+        from writ.session.gate_token import gate_token_path, read_gate_identity
+
+        sid = _sid("readident-five")
+        with _mint_cleanup(sid):
+            Path(gate_token_path(sid)).write_text(
+                f"{uuid.uuid4().hex}\n\n\n\nENF-TEST-001\n"
+            )
+            identity = read_gate_identity(sid)
+        assert tuple(identity) == ("", "")
+
+    def test_a_four_line_token_reads_empty_identity(self):
+        from writ.session.gate_token import gate_token_path, read_gate_identity
+
+        sid = _sid("readident-four")
+        with _mint_cleanup(sid):
+            Path(gate_token_path(sid)).write_text(f"{uuid.uuid4().hex}\nphase-a\nabc123\n\n")
+            identity = read_gate_identity(sid)
+        assert tuple(identity) == ("", "")
+
+    def test_reading_the_identity_does_not_consume_the_token(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token, read_gate_identity
+
+        sid = _sid("readident-keeps")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", os_login=FIXED_LOGIN, git_name="")
+            read_gate_identity(sid)
+            assert os.path.exists(gate_token_path(sid))
+
+
+class TestIdentityIsNotABinding:
+    """Identity lines never change the outcome of the binding comparison or the claim."""
+
+    def test_the_claim_signature_gained_no_identity_parameter(self):
+        import inspect
+
+        from writ.session.gate_token import claim_gate_token, gate_binding_refusal
+
+        for fn in (claim_gate_token, gate_binding_refusal):
+            names = set(inspect.signature(fn).parameters)
+            assert not names & {"os_login", "git_name", "identity"}, (fn.__name__, names)
+
+    def test_tokens_with_different_identities_are_refused_and_accepted_identically(self):
+        from writ.session.gate_token import claim_gate_token, gate_binding_refusal, mint_gate_token
+
+        outcomes = []
+        for login, name in ((FIXED_LOGIN, FIXED_GIT_NAME), ("someone-else", ""), ("", "")):
+            sid = _sid("notbinding")
+            with _mint_cleanup(sid):
+                token = mint_gate_token(
+                    sid, gate="", plan_hash="", rule_id="ENF-TEST-001",
+                    os_login=login, git_name=name,
+                )
+                pre = gate_binding_refusal(sid, gate="", plan_hash="", rule_id="ENF-TEST-001")
+                claimed = claim_gate_token(
+                    sid, token, gate="", plan_hash="", rule_id="ENF-TEST-001",
+                )
+                outcomes.append((pre, claimed))
+        assert outcomes == [("", True)] * 3
+
+    def test_a_mismatch_is_still_named_by_its_binding_class_whatever_the_identity(self):
+        from writ.session.gate_token import BINDING_RULE_MISMATCH, gate_binding_refusal, mint_gate_token
+
+        sid = _sid("notbinding-mismatch")
+        with _mint_cleanup(sid):
+            mint_gate_token(
+                sid, gate="", plan_hash="", rule_id="ENF-RULE-A",
+                os_login=FIXED_LOGIN, git_name=FIXED_GIT_NAME,
+            )
+            assert gate_binding_refusal(
+                sid, gate="", plan_hash="", rule_id="ENF-RULE-B",
+            ) == BINDING_RULE_MISMATCH
+
+    def test_a_five_line_token_still_claims_under_its_binding(self):
+        from writ.session.gate_token import claim_gate_token, gate_token_path
+
+        sid = _sid("notbinding-five")
+        with _mint_cleanup(sid):
+            token = uuid.uuid4().hex
+            Path(gate_token_path(sid)).write_text(f"{token}\n\n\n\nENF-TEST-001\n")
+            assert claim_gate_token(
+                sid, token, gate="", plan_hash="", rule_id="ENF-TEST-001",
+            ) is True
+
+
+class TestRuleActionBinding:
+    """Line 5 binds an ACTION on a rule, so an approval for one action cannot be spent
+    on another. Promote keeps the bare rule id; every other action is qualified."""
+
+    def test_promote_keeps_the_bare_rule_id(self):
+        from writ.session.gate_token import rule_action_binding
+
+        assert rule_action_binding("promote", "ENF-TEST-001") == "ENF-TEST-001"
+
+    def test_dispute_and_verify_are_qualified_by_action(self):
+        from writ.session.gate_token import rule_action_binding
+
+        assert rule_action_binding("dispute", "ENF-TEST-001") == "dispute:ENF-TEST-001"
+        assert rule_action_binding("verify", "ENF-TEST-001") == "verify:ENF-TEST-001"
+
+    def test_a_qualified_binding_can_never_equal_a_real_rule_id(self):
+        from writ.graph.schema import RULE_ID_PATTERN
+        from writ.session.gate_token import rule_action_binding
+
+        assert RULE_ID_PATTERN.match("ENF-TEST-001")
+        for action in ("dispute", "verify"):
+            assert RULE_ID_PATTERN.match(rule_action_binding(action, "ENF-TEST-001")) is None
+
+    def test_a_token_bound_to_the_bare_rule_is_refused_for_dispute_and_verify(self):
+        from writ.session.gate_token import (
+            BINDING_RULE_MISMATCH, gate_binding_refusal, mint_gate_token, rule_action_binding,
+        )
+
+        sid = _sid("actionbind-bare")
+        with _mint_cleanup(sid):
+            mint_gate_token(sid, gate="", plan_hash="", rule_id="ENF-TEST-001")
+            for action in ("dispute", "verify"):
+                assert gate_binding_refusal(
+                    sid, gate="", plan_hash="",
+                    rule_id=rule_action_binding(action, "ENF-TEST-001"),
+                ) == BINDING_RULE_MISMATCH
+            assert gate_binding_refusal(
+                sid, gate="", plan_hash="",
+                rule_id=rule_action_binding("promote", "ENF-TEST-001"),
+            ) == ""
+
+    def test_a_token_bound_to_dispute_is_refused_for_promote_and_verify(self):
+        from writ.session.gate_token import (
+            BINDING_RULE_MISMATCH, claim_gate_token, gate_binding_refusal,
+            gate_token_path, mint_gate_token, rule_action_binding,
+        )
+
+        sid = _sid("actionbind-dispute")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(
+                sid, gate="", plan_hash="",
+                rule_id=rule_action_binding("dispute", "ENF-TEST-001"),
+            )
+            for action in ("promote", "verify"):
+                bound = rule_action_binding(action, "ENF-TEST-001")
+                assert gate_binding_refusal(
+                    sid, gate="", plan_hash="", rule_id=bound,
+                ) == BINDING_RULE_MISMATCH
+                assert claim_gate_token(
+                    sid, token, gate="", plan_hash="", rule_id=bound,
+                ) is False
+                assert os.path.exists(gate_token_path(sid)), "a refused claim must not consume"
+            assert claim_gate_token(
+                sid, token, gate="", plan_hash="",
+                rule_id=rule_action_binding("dispute", "ENF-TEST-001"),
+            ) is True
+
+
+class TestFieldCountIncludesTheIdentityLines:
+    """Capability 27, on top of the signature-derived guard above: the two new binding
+    parameters exist, and both writers still agree with the signature on the count."""
+
+    def test_the_mint_signature_declares_both_identity_parameters(self):
+        names = _binding_parameters()
+        assert "os_login" in names
+        assert "git_name" in names
+
+    def test_a_minted_token_with_identity_carries_one_line_per_parameter(self):
+        from writ.session.gate_token import gate_token_path, mint_gate_token
+
+        expected = _binding_parameters()
+        sid = _sid("fieldcount-ident")
+        with _mint_cleanup(sid):
+            mint_gate_token(
+                sid, gate="phase-a", plan_hash="abc123def456", candidate_id="CAND-1",
+                rule_id="ENF-TEST-003", os_login=FIXED_LOGIN, git_name=FIXED_GIT_NAME,
+            )
+            fields = _token_fields(Path(gate_token_path(sid)).read_text())
+        assert len(fields) == len(expected), (expected, fields)
+
+    def test_the_bash_writer_agrees_with_the_signature_with_and_without_identity_arguments(
+        self, tmp_path,
+    ):
+        expected = _binding_parameters()
+        with_args = _bash_write(
+            tmp_path, str(tmp_path / "with-args"), "tok", "phase-a", "0123456789ab",
+            "CAND-1", "ENF-TEST-003", FIXED_LOGIN, FIXED_GIT_NAME,
+        )
+        captured = _bash_write(
+            tmp_path, str(tmp_path / "captured"), "tok", "phase-a", "0123456789ab",
+            "CAND-1", "ENF-TEST-003",
+            env_extra={"GIT_CONFIG_GLOBAL": _gitconfig_path(tmp_path, None)},
+        )
+        assert len(_token_fields(with_args.decode())) == len(expected)
+        assert len(_token_fields(captured.decode())) == len(expected)
+
+
+# ---------------------------------------------------------------------------
+# F3: one comparison over a snapshot, and a claim that checks the secret first
+# ---------------------------------------------------------------------------
+
+_SNAP_REFUSAL_CASES = [
+    ("absent", None, {}),
+    ("one-line", ["secret"], {}),
+    ("gate-mismatch", ["secret", "phase-a", "h1", "", ""], {"gate": "test-skeletons", "plan_hash": "h1"}),
+    ("plan-drift", ["secret", "phase-a", "h1", "", ""], {"gate": "phase-a", "plan_hash": "h2"}),
+    ("candidate-mismatch", ["secret", "phase-a", "h1", "C-1", ""],
+     {"gate": "phase-a", "plan_hash": "h1", "candidate_id": "C-2"}),
+    ("rule-mismatch", ["secret", "phase-a", "h1", "", "ENF-A-001"],
+     {"gate": "phase-a", "plan_hash": "h1", "rule_id": "ENF-B-001"}),
+    ("authorized", ["secret", "phase-a", "h1", "C-1", "ENF-A-001", "bob", "Bob B"],
+     {"gate": "phase-a", "plan_hash": "h1", "candidate_id": "C-1", "rule_id": "ENF-A-001"}),
+    ("three-line-legacy", ["secret", "phase-a", "h1"], {"gate": "phase-a", "plan_hash": "h1"}),
+]
+
+
+class TestSnapshotBindingRefusal:
+    @pytest.mark.parametrize("label, lines, kwargs", _SNAP_REFUSAL_CASES,
+                             ids=[c[0] for c in _SNAP_REFUSAL_CASES])
+    def test_it_returns_the_class_binding_refusal_returns(self, label, lines, kwargs):
+        from writ.session.gate_token import _binding_refusal, _snapshot, snapshot_binding_refusal
+
+        kwargs = {"gate": "", "plan_hash": "", **kwargs}
+        snap = _snapshot(lines) if lines is not None else None
+        expected = _binding_refusal(
+            lines, kwargs["gate"], kwargs["plan_hash"],
+            kwargs.get("candidate_id", ""), kwargs.get("rule_id", ""),
+        )
+        assert snapshot_binding_refusal(snap, **kwargs) == expected
+        assert (expected == "") is (label in {"authorized", "three-line-legacy"})
+
+    def test_binding_refusal_delegates_to_it(self, monkeypatch):
+        import writ.session.gate_token as gt
+
+        monkeypatch.setattr(gt, "snapshot_binding_refusal", lambda *a, **k: "sentinel-class")
+        assert gt._binding_refusal(["s", "g", "h"], "g", "h") == "sentinel-class"
+        assert gt._binding_refusal(None, "g", "h") == "sentinel-class"
+
+
+class TestClaimChecksTheSecretBeforeTheRename:
+    def test_a_wrong_secret_on_a_correctly_bound_token_leaves_the_file_unchanged(self):
+        from writ.session.gate_token import claim_gate_token, gate_token_path, mint_gate_token
+
+        sid = _sid("wrongsecret")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            before = Path(gate_token_path(sid)).read_bytes()
+            claimed = claim_gate_token(sid, token + "-stale", gate="phase-a", plan_hash="abc123def456")
+            assert claimed is False
+            assert os.path.exists(gate_token_path(sid))
+            assert Path(gate_token_path(sid)).read_bytes() == before
+
+    def test_the_right_secret_still_claims_and_spends_the_file(self):
+        from writ.session.gate_token import claim_gate_token, gate_token_path, mint_gate_token
+
+        sid = _sid("rightsecret")
+        with _mint_cleanup(sid):
+            token = mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            assert claim_gate_token(sid, token, gate="phase-a", plan_hash="abc123def456") is True
+            assert not os.path.exists(gate_token_path(sid))
+
+    def test_the_pre_check_is_still_one_token_file_read(self, monkeypatch):
+        import writ.session.gate_token as gt
+
+        sid = _sid("onepre")
+        calls = []
+        real = gt._token_file_lines
+
+        def counting(session_id):
+            calls.append(session_id)
+            return real(session_id)
+
+        with _mint_cleanup(sid):
+            token = gt.mint_gate_token(sid, gate="phase-a", plan_hash="abc123def456")
+            monkeypatch.setattr(gt, "_token_file_lines", counting)
+            assert gt.claim_gate_token(sid, token, gate="phase-a", plan_hash="abc123def456") is True
+        assert calls == [sid]

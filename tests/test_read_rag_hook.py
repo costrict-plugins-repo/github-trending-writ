@@ -1,0 +1,122 @@
+"""Tests for writ-read-rag.sh PreToolUse hook behavior.
+
+Since the hook is a shell script that queries an HTTP endpoint, these tests
+verify the mode-filtering logic by testing the session helper commands the
+hook depends on. The hook's mode check (`mode get` -> skip if not review/debug)
+is the critical behavior to verify.
+
+Per TEST-TDD-001: skeletons approved before implementation.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+
+import pytest
+
+# autouse: pins cwd to a sandbox so `mode set` cannot delete THIS repo's gate artifacts.
+from tests.fixtures.session_state import sandbox_cwd  # noqa: F401
+
+HELPER_PATH = os.path.join(
+    os.path.dirname(__file__), os.pardir, "bin", "lib", "writ-session.py"
+)
+
+spec = importlib.util.spec_from_file_location("writ_session", HELPER_PATH)
+writ_session = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(writ_session)
+
+
+@pytest.fixture()
+def session_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("WRIT_CACHE_DIR", str(tmp_path))
+    return "test-read-rag"
+
+
+class TestReadRagModeFilter:
+    """The hook should only fire in review and debug modes."""
+
+    def test_review_mode_should_fire(self, session_id, capsys):
+        """Review mode: hook should proceed (mode get returns 'review')."""
+        writ_session.cmd_mode(session_id, "set", "review")
+        capsys.readouterr()
+        writ_session.cmd_mode(session_id, "get")
+        out = capsys.readouterr().out.strip()
+        assert out == "review"
+
+    def test_debug_mode_should_fire(self, session_id, capsys):
+        """Debug mode: hook should proceed (mode get returns 'debug')."""
+        writ_session.cmd_mode(session_id, "set", "debug")
+        capsys.readouterr()
+        writ_session.cmd_mode(session_id, "get")
+        out = capsys.readouterr().out.strip()
+        assert out == "debug"
+
+    def test_conversation_mode_should_skip(self, session_id, capsys):
+        """Conversation mode: hook should exit early."""
+        writ_session.cmd_mode(session_id, "set", "conversation")
+        capsys.readouterr()
+        writ_session.cmd_mode(session_id, "get")
+        out = capsys.readouterr().out.strip()
+        assert out == "conversation"
+        assert out not in ("review", "debug")
+
+    def test_work_mode_should_skip(self, session_id, capsys):
+        """Work mode: hook should exit early (pretool-rag handles writes)."""
+        writ_session.cmd_mode(session_id, "set", "work")
+        capsys.readouterr()
+        writ_session.cmd_mode(session_id, "get")
+        out = capsys.readouterr().out.strip()
+        assert out == "work"
+        assert out not in ("review", "debug")
+
+    def test_no_mode_should_skip(self, session_id, capsys):
+        """No mode set: hook should exit early."""
+        writ_session.cmd_mode(session_id, "get")
+        out = capsys.readouterr().out.strip()
+        assert out == ""
+
+
+class TestReadRagBudgetRespect:
+    """The hook should respect budget and context pressure limits."""
+
+    def test_budget_exhausted_should_skip(self, session_id):
+        """When remaining budget is 0, cmd_should_skip returns True."""
+        writ_session.cmd_mode(session_id, "set", "review")
+        writ_session.cmd_update(session_id, ["--cost", "8000"])
+        assert writ_session.cmd_should_skip(session_id) is True
+
+    def test_context_pressure_high_should_skip(self, session_id):
+        """When context pressure > 75%, cmd_should_skip returns True."""
+        writ_session.cmd_mode(session_id, "set", "review")
+        writ_session.cmd_update(session_id, ["--context-percent", "80"])
+        assert writ_session.cmd_should_skip(session_id) is True
+
+    def test_budget_available_should_proceed(self, session_id):
+        """When budget is available, cmd_should_skip returns False."""
+        writ_session.cmd_mode(session_id, "set", "review")
+        assert writ_session.cmd_should_skip(session_id) is False
+
+
+class TestReadRagHookSyntax:
+    """Verify the hook file exists and has valid shell syntax."""
+
+    def test_hook_file_exists(self):
+        hook_path = os.path.join(
+            os.path.dirname(__file__), os.pardir,
+            "hooks", "scripts", "writ-read-rag.sh"
+        )
+        assert os.path.exists(hook_path), f"Hook file not found: {hook_path}"
+
+    def test_hook_has_valid_shell_syntax(self):
+        import subprocess
+        hook_path = os.path.join(
+            os.path.dirname(__file__), os.pardir,
+            "hooks", "scripts", "writ-read-rag.sh"
+        )
+        result = subprocess.run(
+            ["bash", "-n", hook_path],
+            capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"Shell syntax error: {result.stderr}"

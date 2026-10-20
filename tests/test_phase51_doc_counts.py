@@ -1,0 +1,177 @@
+"""Phase 5.1: source-derived count regression gate.
+
+A pure (no-Neo4j) test that pins stable counts derived from SOURCE (schema,
+config, hooks.json, route decorators). Documentation is intentionally not
+asserted against here: doc prose can go stale independently of whether the
+code is correct, so a test suite failure must never hinge on doc content.
+
+Four source-derived counts:
+  node types  -- len(NODE_ID_FIELDS)  == 13
+  edge types  -- len(ALLOWED_EDGE_TYPES) == 25
+  modes       -- len(MODE_CONFIG)     == 5
+  hooks       -- json.load hooks/hooks.json, count "command" leaves == 52
+  endpoints   -- regex @app/@router route decorators across writ/server/**.py == 52
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+from writ.graph.db import ALLOWED_EDGE_TYPES
+from writ.graph.schema import NODE_ID_FIELDS
+from writ.session.mode_engine import MODE_CONFIG
+
+from tests.conftest import writ_server_source
+
+# ---------------------------------------------------------------------------
+# Repo paths
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parent.parent
+HOOKS_JSON = REPO_ROOT / "hooks" / "hooks.json"
+
+# ---------------------------------------------------------------------------
+# Source-derived counts (computed once at import time -- always run, never skip)
+# ---------------------------------------------------------------------------
+SOURCE_NODE_TYPE_COUNT: int = len(NODE_ID_FIELDS)
+SOURCE_EDGE_TYPE_COUNT: int = len(ALLOWED_EDGE_TYPES)
+SOURCE_MODE_COUNT: int = len(MODE_CONFIG)
+
+
+def _count_hooks_json_entries() -> int:
+    """Count JSON objects that carry a 'command' key in hooks/hooks.json."""
+    data = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
+    # The file is a list of objects, each representing one hook registration.
+    # Count entries with a "command" key (leaf hook objects).
+    if isinstance(data, list):
+        return sum(1 for entry in data if "command" in entry)
+    # Nested format: {event: [{command: ...}, ...], ...}
+    count = 0
+    def _walk(obj):
+        nonlocal count
+        if isinstance(obj, dict):
+            if "command" in obj:
+                count += 1
+            else:
+                for v in obj.values():
+                    _walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+    _walk(data)
+    return count
+
+
+def _count_server_endpoints() -> int:
+    """Count `@app.<verb>` and `@router.<verb>` route decorators across the
+    writ.server module/package (layout-agnostic; see writ_server_source())."""
+    text = writ_server_source()
+    return len(re.findall(r"^@(?:app|router)\.(get|post|put|delete|patch)", text, re.MULTILINE))
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestDocCounts:
+    """Regression gate: each stable count derived from source must match the doc claim."""
+
+    # --- node types ---------------------------------------------------------
+
+    def test_node_types_source_count(self) -> None:
+        assert SOURCE_NODE_TYPE_COUNT == 13, (
+            f"NODE_ID_FIELDS has {SOURCE_NODE_TYPE_COUNT} entries; "
+            "update this test and the docs if the schema changed"
+        )
+
+    # --- edge types ---------------------------------------------------------
+
+    def test_edge_types_source_count(self) -> None:
+        # APPLIES_TO and JUSTIFIED_BY were retired (19 -> 17); later features
+        # added edge types, so the current source-of-truth count is 25
+        # (program item 7a added ABOUT).
+        assert SOURCE_EDGE_TYPE_COUNT == 25, (
+            f"ALLOWED_EDGE_TYPES has {SOURCE_EDGE_TYPE_COUNT} entries; expected 25. "
+            "If this changed, update writ/graph/db/_common.py ALLOWED_EDGE_TYPES."
+        )
+
+    # --- modes --------------------------------------------------------------
+
+    def test_modes_source_count(self) -> None:
+        assert SOURCE_MODE_COUNT == 5, (
+            f"MODE_CONFIG has {SOURCE_MODE_COUNT} entries; "
+            "update this test if a mode was added or removed"
+        )
+
+    def test_all_mode_names_importable(self) -> None:
+        expected_names = {"work", "debug", "review", "conversation", "investigate"}
+        assert set(MODE_CONFIG.keys()) == expected_names, (
+            f"MODE_CONFIG keys differ: got {set(MODE_CONFIG.keys())}"
+        )
+
+    # --- hooks --------------------------------------------------------------
+
+    def test_hooks_json_entry_count(self) -> None:
+        # 44 = the 41 long-standing registrations + writ-manual-test-grant.sh +
+        # writ-state-write-gate.sh + writ-memory-capture.sh (the auto-memory mirror).
+        #
+        # THIS IS THE CANONICAL TRIPWIRE for the registration count, and it keeps its
+        # literal on purpose: reviewing a population change is this file's declared job.
+        # Cycle K deleted the three COPIES of this number (test_pol5b4,
+        # tests/plugin/test_hooks_routing, and a HANDBOOK sentence's worth of drift), so a
+        # deliberate change now edits one assertion instead of four.
+        # 48 = the 45 pinned here before the per-prompt injection split + the three
+        # section hooks it added on UserPromptSubmit (writ-inject-always-on.sh,
+        # writ-inject-methodology.sh, writ-inject-recall.sh;
+        # docs/adr/ADR-prompt-injection-split.md).
+        # 51 = 48 + the tool-failure budget's three registrations (program item 7c,
+        # docs/adr/ADR-tool-failure-budget.md): writ-tool-failure-record.sh on
+        # PostToolUseFailure and writ-tool-failure-budget.sh on PreToolUse and PostToolUse.
+        # 52 = 51 + writ-inject-documents.sh, the fifth UserPromptSubmit injection hook
+        # (program item 5, workstream D: long documents; docs/adr/ADR-document-retrieval.md).
+        source_count = _count_hooks_json_entries()
+        assert source_count == 52, (
+            f"hooks/hooks.json has {source_count} 'command' entries; expected 52. "
+            "Bump this (and HANDBOOK 'registers **N hook scripts**') when adding or "
+            "removing a registration."
+        )
+
+    def test_hooks_json_event_count(self) -> None:
+        """The canonical tripwire for the EVENT count, moved here in cycle K.
+
+        Ten sites across four files restated "12 hook events" and every one of them broke
+        together whenever an event was wired. They now derive from tests/_inventory.py, so
+        this is the one place a deliberate change is reviewed. It belongs in this file
+        because reviewing source-derived counts is what this file is for.
+        """
+        events = json.loads(HOOKS_JSON.read_text()).get("hooks") or {}
+        assert len(events) == 12, (
+            f"hooks/hooks.json registers {len(events)} events; expected 12. Bump this when "
+            "wiring a new Claude Code event, and nothing else needs editing."
+        )
+
+    # --- endpoints ----------------------------------------------------------
+
+    def test_server_endpoint_count(self) -> None:
+        # source_count is derived from writ_server_source(), which scans
+        # writ/server/**/*.py and matches both @app.<verb> and @router.<verb>
+        # decorators. Bump this when adding/removing a route.
+        # 48 = 46 + the GET and POST halves of /session/{sid}/review-findings
+        # (the reviewer-verdict record behind the commit gate, 2026-08-06).
+        # 49 = 48 + GET /session/{sid}/prompt-state (2026-08-08): should_skip, known,
+        # escalation and the full cache from ONE read, replacing three round trips the
+        # RAG hook made on every prompt.
+        # 50 = 49 + POST /session/{sid}/promotion-review (2026-08-25): surfaces a
+        # graduation_pending candidate for human review AND records it, which is what
+        # lets the next approval bind to one candidate instead of authorizing any.
+        # 49 = 50 - the session-cache key setter (2026-08-26): an arbitrary-key writer
+        # with no callers, which could set the gate inputs `mode` and `current_phase`
+        # over unauthenticated localhost HTTP. See tests/test_daemon_authorization.py.
+        # 51 = 49 + POST /feedback/batch + POST /subagent/start-context (plan
+        # f7fc2b37-9a53-4011-a69f-e6b97f5e45fe, batch 4: one batched SessionEnd
+        # feedback write, one composite daemon call for SubagentStart context).
+        # 52 = 51 + POST /retrieval/reload (program item 2: live reload, unix socket only).
+        source_count = _count_server_endpoints()
+        assert source_count == 52, (
+            f"writ.server has {source_count} @app/@router route decorators; expected 52"
+        )
