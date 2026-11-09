@@ -1,0 +1,547 @@
+"""Tests for the Wave-3 dedup: hooks/scripts/writ-read-rag.sh:164-187 and
+hooks/scripts/writ-posttool-rag.sh:197-220 currently inline byte-identical
+"build the /query request + POST it" bodies (only the budget variable name
+and REQUEST/RESPONSE casing differ). The planned fix moves this into a single
+`rag_query()` bash function in bin/lib/common.sh (already sourced by both
+hooks); the hooks then call `rag_query "$QUERY" "$PRETOOL_BUDGET"/"$POSTTOOL_BUDGET"
+"$LOADED_RULE_IDS"` instead of inlining the python3 -c + curl pair.
+
+RED now:
+  - TestStaticByteIdentity        -- common.sh has no rag_query() function yet.
+  - TestBehavioralParityVsHeadInline -- same (helper undefined -> empty stdout,
+    mismatches the frozen HEAD-inline reference).
+  - TestSetEDoesNotAbort          -- same (undefined command aborts a set -e
+    script before it reaches its own `exit 7`).
+  - TestHooksAdoptRagQuery        -- neither hook has been repointed yet.
+
+GREEN always (pre-existing regression guards this cycle must not disturb):
+  - TestUntouchedTailInvariants.
+
+Run: .venv/bin/python -m pytest tests/test_rag_query_helper.py -q
+
+--- Isolation cycle v2 (plan.md, Part 3), 2026-08-11 ---
+
+TestProjectRootScoping and TestHooksSendProjectRoot (appended below) pin
+capability: "rag_query sends the caller's project root and both hook callers
+pass it, so the read and post-write RAG channels are scoped." rag_query widens
+to a 4th positional arg, `project_root`, forwarded into the JSON body under the
+same key QueryRequest.project_root now accepts (see
+tests/test_query_route_project_scope.py). Both hooks already compute a project
+root today for the gate-artifact path (writ-rag-inject.sh's `_PROJECT_ROOT=
+$(detect_project_root "$(pwd -P)")`); writ-read-rag.sh and writ-posttool-rag.sh
+do not compute one yet, so wiring this in also requires each hook to call
+detect_project_root itself before it calls rag_query.
+
+RED today: rag_query takes exactly 3 positional args and the JSON body it
+builds has no project_root key; neither hook computes a PROJECT_ROOT variable.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tests.fixtures.net import free_port as _free_port
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+COMMON_SH = REPO_ROOT / "bin" / "lib" / "common.sh"
+HOOKS_DIR = REPO_ROOT / "hooks" / "scripts"
+READ_RAG_HOOK = HOOKS_DIR / "writ-read-rag.sh"
+POSTTOOL_RAG_HOOK = HOOKS_DIR / "writ-posttool-rag.sh"
+
+
+# ── Frozen HEAD reference (do NOT read live from the hooks -- they change
+# after the implementation lands; hardcode the byte-for-byte HEAD behavior,
+# same discipline as tests/test_phase_scoped_rules.py's HEAD_BODY). Mirrors
+# hooks/scripts/writ-read-rag.sh:165-183 exactly, with QUERY/BUDGET/EXCLUDE
+# taken from positional args ($1/$2/$3) instead of $QUERY/$PRETOOL_BUDGET/
+# $LOADED_RULE_IDS, and WRIT_URL read from the environment (as both hooks do).
+HEAD_BUILD_POST = r'''
+QUERY="$1"
+BUDGET="$2"
+EXCLUDE="$3"
+REQUEST=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'query': sys.argv[1],
+    'budget_tokens': int(sys.argv[2]),
+    'exclude_rule_ids': json.loads(sys.argv[3]),
+    'top_k': 3,
+}))
+" "$QUERY" "$BUDGET" "$EXCLUDE" 2>/dev/null)
+
+if [ -z "$REQUEST" ]; then
+    exit 0
+fi
+
+RESPONSE=$(curl -s --connect-timeout 0.3 --max-time 1 \
+    -X POST "$WRIT_URL" \
+    -H "Content-Type: application/json" \
+    -d "$REQUEST" 2>/dev/null) || true
+
+printf '%s' "$RESPONSE"
+'''
+
+
+def _extract_bash_function(source: str, name: str) -> str | None:
+    """Extract `name() { ... }` (including the braces) from bash source text
+    via brace counting (handles the nested `{...}` of the embedded python
+    dict literal). Returns None if the function is not defined."""
+    marker = f"{name}() {{"
+    idx = source.find(marker)
+    if idx == -1:
+        return None
+    brace_idx = idx + len(marker) - 1  # index of the opening "{"
+    depth = 0
+    i = brace_idx
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[idx : i + 1]
+        i += 1
+    return None
+
+
+def _closed_port() -> int:
+    """A port that is guaranteed free-but-unlistened-on right now, so a
+    connection to it is refused quickly (models "server is down")."""
+    return _free_port()
+
+
+def _make_stub_handler_class():
+    """Builds a fresh BaseHTTPRequestHandler subclass with its own isolated
+    `received` list (TEST-ISOLATE-001 -- no cross-test shared mutable state).
+    Answers POST /query with a fixed rule body; records the parsed request."""
+    received: list = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence stderr noise
+            pass
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length)
+            try:
+                parsed = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                parsed = {"_raw": raw.decode("utf-8", errors="replace")}
+            received.append(parsed)
+            body = json.dumps(
+                {"rules": [{"rule_id": "X-1", "score": 0.9, "statement": "s"}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            self.send_error(404)
+
+    return Handler, received
+
+
+@pytest.fixture()
+def stub_server():
+    """An isolated local stub /query HTTP server (thread, ephemeral port),
+    modeled on tests/test_read_rag_investigate_gate.py's _QueryStub. Skips
+    gracefully if the environment cannot bind a local socket."""
+    handler_cls, received = _make_stub_handler_class()
+    port = _free_port()
+    try:
+        srv = HTTPServer(("127.0.0.1", port), handler_cls)
+    except OSError:
+        pytest.skip("could not bind a local stub /query server")
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield SimpleNamespace(url=f"http://127.0.0.1:{port}/query", requests=received)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _run_rag_query_helper(query: str, budget: str, exclude: str, writ_url: str):
+    """Runs `source common.sh; WRIT_URL=<writ_url>; RESPONSE=$(rag_query ...);
+    printf '%s' "$RESPONSE"`. The command-substitution + `printf '%s'` mirrors
+    exactly how both hooks consume rag_query (`RESPONSE=$(rag_query ...)`), so
+    trailing-newline stripping matches the real call site and the parity vs
+    _run_head_build_post is apples-to-apples (not raw-stdout vs stripped).
+    Args are passed via argv (never spliced into the script text) so malformed
+    exclude strings (brackets/quotes) can never break the script."""
+    script = 'source "$1"; WRIT_URL="$2"; RESPONSE=$(rag_query "$3" "$4" "$5"); printf "%s" "$RESPONSE"'
+    return subprocess.run(
+        ["bash", "-c", script, "bash", str(COMMON_SH), writ_url, query, budget, exclude],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def _run_rag_query_helper_with_root(
+    query: str, budget: str, exclude: str, project_root: str, writ_url: str,
+):
+    """Same call shape as _run_rag_query_helper, with the 4th positional arg
+    rag_query must gain: the caller's project root."""
+    script = (
+        'source "$1"; WRIT_URL="$2"; RESPONSE=$(rag_query "$3" "$4" "$5" "$6"); '
+        'printf "%s" "$RESPONSE"'
+    )
+    return subprocess.run(
+        ["bash", "-c", script, "bash", str(COMMON_SH), writ_url, query, budget, exclude, project_root],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def _run_head_build_post(query: str, budget: str, exclude: str, writ_url: str):
+    """Runs the frozen HEAD_BUILD_POST reference with the same three inputs,
+    WRIT_URL supplied via env exactly as the hooks set it."""
+    env = os.environ.copy()
+    env["WRIT_URL"] = writ_url
+    return subprocess.run(
+        ["bash", "-c", HEAD_BUILD_POST, "bash", query, budget, exclude],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+
+
+# -- 1. Source-level proof: the moved body is byte-identical to HEAD --------
+
+
+class TestStaticByteIdentity:
+    """No subprocess execution -- pure text extraction from bin/lib/common.sh.
+    RED until rag_query() exists there with the exact HEAD request-build +
+    curl invocation moved in verbatim."""
+
+    def _rag_query_body(self) -> str:
+        source = COMMON_SH.read_text()
+        body = _extract_bash_function(source, "rag_query")
+        if body is None:
+            pytest.fail(
+                "bin/lib/common.sh has no rag_query() function yet "
+                "(RED: the Wave-3 rag_query dedup helper has not been added)."
+            )
+        return body
+
+    def test_rag_query_function_exists_in_common_sh(self):
+        assert self._rag_query_body() is not None
+
+    def test_request_build_matches_head_inline_json_fields(self):
+        body = self._rag_query_body()
+        assert "'budget_tokens': int(sys.argv[2])," in body
+        assert "'exclude_rule_ids': json.loads(sys.argv[3])," in body
+        assert "'top_k': 3," in body
+
+    def test_post_invocation_keeps_the_head_inline_parameters(self):
+        """The POST moved from a raw curl to the curl-first writ_http_post wrapper (curl
+        is an optional accelerator now, so a curl-less machine must still retrieve rules).
+        The parameters it carried are unchanged: same URL, same JSON body variable, same
+        0.3s connect / 1s total budget, same fail-open redirect."""
+        body = self._rag_query_body()
+        assert not re.search(r"curl\s+-", body), (
+            "rag_query must POST through writ_http_post, not raw curl"
+        )
+        assert "WRIT_HTTP_CONNECT_TIMEOUT=0.3" in body and "WRIT_HTTP_TIMEOUT=1" in body, (
+            "the connect/total budgets the inline curl carried must be preserved"
+        )
+        assert 'writ_http_post "$WRIT_URL"' in body
+        # Lowercase local `$request`, unlike the hooks' `$REQUEST`.
+        assert '"$request"' in body
+        assert "2>/dev/null || true" in body
+
+    def test_empty_request_guard_present(self):
+        body = self._rag_query_body()
+        assert '[ -z "$request" ] && return 0' in body
+
+
+# -- 2. Behavioral parity vs. the frozen HEAD inline snippet -----------------
+
+
+class TestBehavioralParityVsHeadInline:
+    """Stub-server-backed differential test: rag_query() must produce
+    byte-identical stdout to the HEAD inline build+POST for every case."""
+
+    @pytest.fixture(autouse=True)
+    def _require_curl(self):
+        if shutil.which("curl") is None:
+            pytest.skip("curl is not available in this environment")
+
+    def test_normal_request_returns_identical_stub_body(self, stub_server):
+        helper_out = _run_rag_query_helper("test", "1500", "[]", stub_server.url)
+        head_out = _run_head_build_post("test", "1500", "[]", stub_server.url)
+        assert json.loads(head_out.stdout) == {
+            "rules": [{"rule_id": "X-1", "score": 0.9, "statement": "s"}]
+        }, "sanity: the frozen HEAD reference must actually reach the stub"
+        assert helper_out.stdout == head_out.stdout
+
+    def test_exclude_rule_ids_passthrough_and_identical_stdout(self, stub_server):
+        helper_out = _run_rag_query_helper("test", "1500", '["A","B"]', stub_server.url)
+        assert len(stub_server.requests) == 1, (
+            "rag_query did not reach the stub server with the expected request"
+        )
+        received = stub_server.requests[-1]
+        assert received.get("exclude_rule_ids") == ["A", "B"]
+        assert received.get("budget_tokens") == 1500
+        assert received.get("top_k") == 3
+
+        head_out = _run_head_build_post("test", "1500", '["A","B"]', stub_server.url)
+        assert helper_out.stdout == head_out.stdout
+
+    def test_malformed_exclude_yields_empty_request_and_no_server_hit(self, stub_server):
+        before = len(stub_server.requests)
+        helper_out = _run_rag_query_helper("test", "1500", "not json{", stub_server.url)
+        assert helper_out.stdout == "", (
+            "rag_query must return empty stdout when the request body fails to build"
+        )
+        assert len(stub_server.requests) == before, (
+            "rag_query must NOT POST to the server when json.loads(exclude) fails"
+        )
+
+        head_out = _run_head_build_post("test", "1500", "not json{", stub_server.url)
+        assert head_out.stdout == ""
+        assert helper_out.stdout == head_out.stdout
+
+    def test_server_down_both_return_empty_stdout(self):
+        closed_url = f"http://127.0.0.1:{_closed_port()}/query"
+        helper_out = _run_rag_query_helper("test", "1500", "[]", closed_url)
+        head_out = _run_head_build_post("test", "1500", "[]", closed_url)
+        assert helper_out.stdout == ""
+        assert head_out.stdout == ""
+        assert helper_out.stdout == head_out.stdout
+
+
+# -- 3. set -e safety ---------------------------------------------------------
+
+
+class TestSetEDoesNotAbort:
+    """rag_query must never abort a caller running under `set -e`, even when
+    its own request-build fails (malformed exclude). The two hooks both run
+    under `set -euo pipefail` at the top of the file."""
+
+    def test_rag_query_does_not_abort_set_e_caller(self):
+        script = (
+            'set -euo pipefail; source "$1"; '
+            'WRIT_URL="http://127.0.0.1:1/query"; '
+            'RESPONSE=$(rag_query "q" "1500" "not json{"); '
+            'echo "AFTER=[$RESPONSE]"; '
+            "exit 7"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(COMMON_SH)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 7, (
+            f"script did not reach its own `exit 7` (rag_query aborted the "
+            f"set -e caller); returncode={result.returncode!r} "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "AFTER=[]" in result.stdout
+
+
+# -- 4. Hook adoption source guard --------------------------------------------
+
+
+class TestHooksAdoptRagQuery:
+    """Reads hook source text directly. RED until each hook is repointed at
+    the new rag_query() helper and its own inline copy is removed."""
+
+    def test_read_rag_invokes_rag_query_helper(self):
+        content = READ_RAG_HOOK.read_text()
+        assert 'rag_query "$QUERY" "$PRETOOL_BUDGET" "$LOADED_RULE_IDS"' in content
+
+    def test_posttool_rag_invokes_rag_query_helper(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert 'rag_query "$QUERY" "$POSTTOOL_BUDGET" "$LOADED_RULE_IDS"' in content
+
+    def test_read_rag_no_longer_inlines_request_build(self):
+        content = READ_RAG_HOOK.read_text()
+        assert content.count("'budget_tokens': int(sys.argv[2])") == 0, (
+            "writ-read-rag.sh still inlines the request-build python body; "
+            "it must call rag_query() instead."
+        )
+
+    def test_posttool_rag_no_longer_inlines_request_build(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert content.count("'budget_tokens': int(sys.argv[2])") == 0, (
+            "writ-posttool-rag.sh still inlines the request-build python body; "
+            "it must call rag_query() instead."
+        )
+
+    def test_read_rag_no_longer_inlines_curl_d_request(self):
+        content = READ_RAG_HOOK.read_text()
+        assert content.count('-d "$REQUEST"') == 0, (
+            "writ-read-rag.sh still inlines its own curl POST; "
+            "it must call rag_query() instead."
+        )
+
+    def test_posttool_rag_no_longer_inlines_curl_d_request(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert content.count('-d "$REQUEST"') == 0, (
+            "writ-posttool-rag.sh still inlines its own curl POST; "
+            "it must call rag_query() instead."
+        )
+
+    def test_read_rag_preserves_empty_response_bail(self):
+        content = READ_RAG_HOOK.read_text()
+        assert 'if [ -z "$RESPONSE" ]; then' in content
+
+    def test_posttool_rag_preserves_empty_response_bail(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert 'if [ -z "$RESPONSE" ]; then' in content
+
+
+# -- 5. Pre-existing invariants this cycle must not disturb ------------------
+
+
+class TestUntouchedTailInvariants:
+    """Guards the three named regression risks. Must PASS at HEAD (before any
+    change) and keep passing after the rag_query adoption -- these are NOT
+    the RED target of this cycle."""
+
+    @staticmethod
+    def _expected_sinks(hook_path) -> int:
+        """DERIVED, not restated. tests/test_debug_gating.py owns
+        HOOK_LOG_SINK_HOOKS; that module's declared job is reviewing those
+        numbers, and this one only needs to know the count did not move while it
+        was changing something else nearby.
+
+        These were two literals here and two more in that table, so adding one
+        legitimate gated sink to writ-read-rag.sh on 2026-09-01 broke two files
+        for one change, which is the duplication tests/_inventory.py exists to
+        delete.
+        """
+        from tests.test_debug_gating import HOOK_LOG_SINK_HOOKS
+
+        by_name = {path.name: count for path, count in HOOK_LOG_SINK_HOOKS}
+        assert hook_path.name in by_name, (
+            f"{hook_path.name} is not in HOOK_LOG_SINK_HOOKS; the canonical "
+            "table and this derivation disagree about which hooks are gated"
+        )
+        return by_name[hook_path.name]
+
+    def test_read_rag_hook_log_sink_redirect_count(self):
+        content = READ_RAG_HOOK.read_text()
+        assert content.count('2>>"$WRIT_HOOK_LOG_SINK"') == self._expected_sinks(
+            READ_RAG_HOOK
+        )
+
+    def test_posttool_rag_hook_log_sink_redirect_count(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert content.count('2>>"$WRIT_HOOK_LOG_SINK"') == self._expected_sinks(
+            POSTTOOL_RAG_HOOK
+        )
+
+    def test_read_rag_retains_injected_context_strings(self):
+        content = READ_RAG_HOOK.read_text()
+        assert "file-context rules for" in content
+        assert "PreToolUse" in content
+        assert "file-read" in content
+
+    def test_posttool_rag_retains_injected_context_strings(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert "post-write rules for" in content
+        assert "PostToolUse" in content
+        assert "file-write-post" in content
+
+    def test_neither_rag_hook_emits_its_own_execution_row(self):
+        """This asserted the opposite for posttool-rag until the telemetry trap became
+        universal: common.sh now writes one row for every script under hooks/scripts/, so
+        an explicit `hook_timer_end` in either hook would be a SECOND row and a python
+        spawn to write it. The asymmetry the original test protected (read-rag stays out of
+        the timer path) survives as symmetry: neither hook emits for itself.
+        """
+        for hook in (POSTTOOL_RAG_HOOK, READ_RAG_HOOK):
+            code = "\n".join(
+                line for line in hook.read_text().splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            assert "hook_timer_end" not in code, (
+                f"{hook.name} emits its own hook_execution row on top of the trap's"
+            )
+
+
+# -- 6. Part 3: project-root scoping ------------------------------------------
+
+
+class TestProjectRootScoping:
+    """Capability: "rag_query sends the caller's project root and both hook
+    callers pass it, so the read and post-write RAG channels are scoped."
+
+    rag_query gains a 4th positional arg. The stub-server differential style
+    from section 2 above is reused: there is no frozen HEAD reference for a
+    feature that doesn't exist at HEAD, so these assert directly on the
+    request the stub server received.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_curl(self):
+        if shutil.which("curl") is None:
+            pytest.skip("curl is not available in this environment")
+
+    def test_project_root_reaches_the_request_body(self, stub_server):
+        _run_rag_query_helper_with_root("test", "1500", "[]", "/repo/proj-a", stub_server.url)
+        assert stub_server.requests, "rag_query did not reach the stub server"
+        assert stub_server.requests[-1].get("project_root") == "/repo/proj-a"
+
+    def test_empty_project_root_still_sends_a_valid_request(self, stub_server):
+        """Backward compat: a caller that has no project root yet (or a hook
+        running before this lands) must not have its query silently dropped."""
+        result = _run_rag_query_helper_with_root("test", "1500", "[]", "", stub_server.url)
+        assert result.stdout != "", "an empty project_root must not empty the whole response"
+        assert stub_server.requests[-1].get("project_root") == ""
+
+    def test_project_root_does_not_disturb_the_other_fields(self, stub_server):
+        _run_rag_query_helper_with_root("test", "1500", '["A","B"]', "/repo/proj-a", stub_server.url)
+        received = stub_server.requests[-1]
+        assert received.get("exclude_rule_ids") == ["A", "B"]
+        assert received.get("budget_tokens") == 1500
+        assert received.get("top_k") == 3
+
+
+class TestHooksSendProjectRoot:
+    """Source-scan half: each hook must actually compute a project root and
+    pass it as rag_query's 4th argument. Modeled on TestHooksAdoptRagQuery."""
+
+    def test_read_rag_computes_a_project_root(self):
+        content = READ_RAG_HOOK.read_text()
+        assert "detect_project_root" in content, (
+            "writ-read-rag.sh must compute a project root before calling rag_query"
+        )
+
+    def test_posttool_rag_computes_a_project_root(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert "detect_project_root" in content, (
+            "writ-posttool-rag.sh must compute a project root before calling rag_query"
+        )
+
+    def test_read_rag_passes_project_root_to_rag_query(self):
+        content = READ_RAG_HOOK.read_text()
+        assert re.search(r'rag_query\s+"\$QUERY"\s+"\$PRETOOL_BUDGET"\s+"\$LOADED_RULE_IDS"\s+"\$[A-Z_]*PROJECT_ROOT"', content), (
+            "writ-read-rag.sh's rag_query call must carry a 4th project-root arg"
+        )
+
+    def test_posttool_rag_passes_project_root_to_rag_query(self):
+        content = POSTTOOL_RAG_HOOK.read_text()
+        assert re.search(r'rag_query\s+"\$QUERY"\s+"\$POSTTOOL_BUDGET"\s+"\$LOADED_RULE_IDS"\s+"\$[A-Z_]*PROJECT_ROOT"', content), (
+            "writ-posttool-rag.sh's rag_query call must carry a 4th project-root arg"
+        )
